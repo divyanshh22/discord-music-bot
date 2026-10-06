@@ -184,18 +184,42 @@ music/
 YouTube challenges data-centre IPs (Render, a VPS) with *"Sign in to confirm
 you're not a bot"*, and yt-dlp cannot answer that on its own.
 `bgutil-ytdlp-pot-provider` supplies the proof-of-origin token. The plugin
-itself comes from `requirements.txt`; the token generator is a node.js app
-that the build clones and compiles into `potprovider/`:
+itself comes from `requirements.txt`; the token generator is a node.js app.
+Render's Python runtime has no node.js by default, so the build command also
+bakes a node binary into the repo (at `node/bin/node`) that the bot finds at
+runtime:
 
 ```bash
-pip install -r requirements.txt && rm -rf potprovider && git clone --depth 1 --single-branch --branch 2.0.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git potprovider && cd potprovider/server && (npm ci || npm install) && npx tsc
+pip install -r requirements.txt
+rm -rf potprovider node
+git clone --depth 1 --single-branch --branch 2.0.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git potprovider
+cd potprovider/server && (npm ci || npm install) && npx tsc && cd ../..
+curl -fsSL -o node.tar.xz https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz
+tar -xJf node.tar.xz && mv node-v22.12.0-linux-x64 node && rm node.tar.xz
 ```
 
 The `rm -rf` matters: Render's build cache kept a `potprovider/` without its
 `package-lock.json`, and `npm ci` refuses to run without one.
 
-Paste that as the service's **Build Command** (Settings → Build & Deploy).
-Audira runs fine without it - it just cannot play from a flagged IP.
+Paste all of that as the service's **Build Command** (Settings → Build &
+Deploy). After a deploy, `bot.py` logs `po-token provider: .../potprovider/server`.
+Without it, or without node, YouTube links fail with *"Sign in to confirm
+you're not a bot"* from a flagged IP.
+
+### YouTube cookies (optional but strongest)
+
+Data-centre rotation occasionally defeats PO-token generation too. The
+reliable fallback is the bot's own YouTube session: export a
+**Netscape-format** cookies file (e.g. with the *Get cookies.txt LOCALLY*
+extension), read it into a base64 string and set it as a `YOUTUBE_COOKIES`
+env var (`DEFAULT_SEARCH` still works without it):
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\path\to\cookies.txt"))
+```
+
+`YOUTUBE_COOKIES` accepts either that base64 blob or a file path, and can
+also live in `.env` for local runs.
 
 Free-tier caveats: the web service spins down after ~15 min of no HTTP
 traffic, and the free Postgres database expires after 30 days.

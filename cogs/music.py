@@ -78,6 +78,13 @@ def find_node() -> str | None:
         if candidate.exists():
             return str(candidate)
 
+    for candidate in (
+        config.BASE_DIR / "node" / "bin" / "node",
+        config.BASE_DIR / "potprovider" / "server" / "node" / "bin" / "node",
+    ):
+        if candidate.exists():
+            return str(candidate)
+
     return None
 
 
@@ -148,6 +155,9 @@ def reason_line(exc: Exception) -> str:
             text = lines[-1]
     if text.startswith("ERROR:"):
         text = text[6:].strip()
+    lowered = text.lower()
+    if "sign in to confirm" in lowered or "not a bot" in lowered:
+        text += " | the po-token provider or YOUTUBE_COOKIES is missing on this deploy"
     return text[:200].replace("`", "'")
 
 
@@ -503,6 +513,7 @@ YOUTUBE_CLIENT_ATTEMPTS: list[dict] = [
     {},
     {"extractor_args": {"youtube": {"player_client": ["tv", "web_safari"]}}},
     {"extractor_args": {"youtube": {"player_client": ["mweb", "android_vr"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["ios", "android"]}}},
 ]
 
 
