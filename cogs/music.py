@@ -780,6 +780,12 @@ def _cut_track(track: Track, seconds: int) -> Track | None:
     )
 
 
+def _is_bot_check(exc: Exception) -> bool:
+    """True when YouTube answered 'sign in to confirm you're not a bot'."""
+    message = str(exc).lower()
+    return "sign in to confirm" in message or "not a bot" in message
+
+
 def _youtube_info(query: str) -> tuple[dict | None, Exception | None]:
     """First usable YouTube/none result for a query across client fallbacks."""
     last_error: Exception | None = None
@@ -797,6 +803,9 @@ def _youtube_info(query: str) -> tuple[dict | None, Exception | None]:
                 time.monotonic() - started,
                 reason_line(exc),
             )
+            if _is_bot_check(exc):
+                log.warning("youtube is blocking this IP - skipping remaining clients")
+                break
     return None, last_error
 
 
@@ -921,7 +930,8 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
         description=f"Now playing **{track.title}**",
         colour=discord.Colour.blurple(),
     )
-    source = track.quality or ("stream" if track.is_stream else "local file")
+    role = f"stream {track.quality}" if track.is_stream and track.quality else None
+    source = role or ("stream" if track.is_stream else "local file")
     embed.add_field(
         name="Details",
         value=f"{source} · {track.duration_label()}",
@@ -1592,19 +1602,13 @@ class Music(commands.Cog):
 
         was_idle = player.is_idle()
         player.notify_channel = interaction.channel
-        if was_idle:
-
-
-            track.announced = True
         player.add(track)
 
         if was_idle:
-            await interaction.followup.send(
-                embed=self._now_playing_embed(track, player)
-            )
+            await interaction.followup.send(f"Now playing **{track.title}**.")
         else:
             await interaction.followup.send(
-                f"Added **{track.title}** to the queue ΓÇö position {len(player.queue)}."
+                f"Added **{track.title}** to the queue - position {len(player.queue)}."
             )
         log.info("play: reply sent")
 
