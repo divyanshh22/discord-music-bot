@@ -897,6 +897,32 @@ class MusicPlayer:
             # loop exactly once instead of trapping the user in a replay.
             self._skip_once = False
 
+    async def _first_playable(self, candidates: list[dict], finished: Track) -> Track | None:
+        """First candidate that actually resolves and isn't a repeat."""
+        for candidate in candidates:
+            title = candidate.get("title") or ""
+            if normalize(title) == normalize(finished.title):
+                continue
+            if any(normalize(title) == normalize(t) for t in self._recent):
+                continue
+            try:
+                track = await asyncio.to_thread(
+                    resolve_track, candidate["webpage_url"], finished.requested_by
+                )
+            except (DownloadError, LookupError, ValueError) as exc:
+                log.warning("autoplay could not resolve %s: %s", title, exc)
+                continue
+            except Exception as exc:
+                log.warning(
+                    "autoplay resolve broke for %s: %s: %s",
+                    title,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            return track
+        return None
+
     async def _queue_autoplay(self, finished: Track) -> None:
         """Keep the music going with something similar when the queue runs dry.
 
@@ -914,64 +940,65 @@ class MusicPlayer:
         self._recent.append(finished.title)
         self._recent = self._recent[-15:]
 
-        # Try the artist first (keeps the next pick in the same style), then
-        # fall back to the title - a search for one of them often comes back
-        # empty while the other still works.
+        # Artist first (keeps the next pick in the same style), then the
+        # title - one of them usually works when the other doesn't.
         queries = [q for q in (finished.artist, finished.title) if q]
-        candidates: list[dict] = []
+        log.info("autoplay: looking for something like %r", finished.title)
+
+        track = None
         for query in queries:
             try:
                 candidates = await asyncio.wait_for(
                     asyncio.to_thread(search_candidates, query, limit=8),
                     timeout=60,
                 )
-            except (DownloadError, LookupError, ValueError, asyncio.TimeoutError) as exc:
-                log.warning("autoplay search failed for %r: %s", query, exc)
-                continue
             except Exception as exc:
                 log.warning(
-                    "autoplay search broke for %r: %s: %s",
+                    "autoplay search failed for %r: %s: %s",
                     query,
                     type(exc).__name__,
                     exc,
                 )
                 continue
-            if candidates:
-                log.info("autoplay searching %r -> %d candidate(s)", query, len(candidates))
+            if not candidates:
+                continue
+            log.info("autoplay: %r -> %d candidate(s)", query, len(candidates))
+            track = await self._first_playable(candidates, finished)
+            if track:
                 break
 
-        if not candidates:
-            log.info("autoplay found no candidates")
+        # YouTube will sometimes answer a search but refuse to stream here.
+        # JioSaavn does neither of those things, so try it directly.
+        if track is None:
+            for query in queries:
+                try:
+                    candidates = await asyncio.wait_for(
+                        asyncio.to_thread(search_jiosaavn, query, limit=5),
+                        timeout=45,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "autoplay jiosaavn search failed for %r: %s: %s",
+                        query,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    continue
+                if not candidates:
+                    continue
+                log.info("autoplay: jiosaavn %r -> %d candidate(s)", query, len(candidates))
+                track = await self._first_playable(candidates, finished)
+                if track:
+                    break
+
+        if track is None:
+            log.info("autoplay found nothing new to play")
             self._notify("Autoplay couldn't find anything similar to play.")
             return
 
-        for candidate in candidates:
-            if normalize(candidate["title"]) == normalize(finished.title):
-                continue
-            if any(normalize(candidate["title"]) == normalize(t) for t in self._recent):
-                continue
-            try:
-                track = await asyncio.to_thread(
-                    resolve_track, candidate["webpage_url"], finished.requested_by
-                )
-            except (DownloadError, LookupError, ValueError) as exc:
-                log.warning("autoplay could not resolve %s: %s", candidate["title"], exc)
-                continue
-            except Exception as exc:
-                log.warning(
-                    "autoplay resolve broke for %s: %s: %s",
-                    candidate["title"],
-                    type(exc).__name__,
-                    exc,
-                )
-                continue
-            log.info("autoplay picked %s", track.title)
-            self.queue.append(track)
-            self._notify(f"Autoplay: **{track.title}**")
-            return
-
-        log.info("autoplay found nothing new to play")
-        self._notify("Autoplay found nothing new - the queue stays empty.")
+        log.info("autoplay picked %s", track.title)
+        self.queue.append(track)
+        self._notify(f"Autoplay: **{track.title}**")
 
     def _notify(self, message: str) -> None:
         """Best-effort notice in the channel that started playback."""
