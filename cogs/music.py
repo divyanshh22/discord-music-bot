@@ -387,6 +387,7 @@ class Track:
         headers: dict[str, str] | None = None,
         artist: str | None = None,
         thumbnail: str | None = None,
+        temp_path: str | None = None,
     ):
         self.source = source
         self.title = title
@@ -404,9 +405,19 @@ class Track:
         # True when a command already posted the now-playing card for this
         # track, so starting it does not post a second one.
         self.announced = False
-        # Seconds to skip to when this track starts - set by /seek, consumed
-        # by _play_one so the restart plays from that point.
-        self.seek_offset = 0
+        # A temporary file backing this track (a /seek cut). Deleted once the
+        # track is done playing so repeated seeks can't pile up disk usage.
+        self.temp_path = temp_path
+
+    def cleanup(self) -> None:
+        """Delete the temporary file backing this track, if there is one."""
+        if not self.temp_path:
+            return
+        try:
+            os.remove(self.temp_path)
+        except OSError:
+            pass
+        self.temp_path = None
 
     @classmethod
     def from_file(cls, path: Path, requested_by: str = "someone") -> Track:
@@ -746,6 +757,61 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
     )
 
 
+def _cut_track(track: Track, seconds: int) -> Track | None:
+    """Return a temporary file copy of `track` starting at `seconds`.
+
+    Seeking straight into a URL (/seek's old way) asked the CDN for a remote
+    byte range, and some CDNs answered with silence. Cutting a local file
+    instead always produces audio - the seek happens in a thread while the
+    current song keeps playing, and the result plays exactly like any local
+    file. Returns the original track untouched when there is nothing to cut.
+    """
+    if seconds <= 0:
+        return track
+
+    handle = tempfile.NamedTemporaryFile(prefix="audira-seek-", suffix=".m4a", delete=False)
+    target = handle.name
+    handle.close()
+
+    before = f"-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -ss {seconds}"
+    if track.headers:
+        blob = "\r\n".join(f"{key}: {value}" for key, value in track.headers.items()) + "\r\n"
+        before += " -headers " + shlex.quote(blob)
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        return None
+
+    # Copy the audio as-is (fast). If the file format fights a raw copy,
+    # remux through an encoder - the container gets picked from the suffix.
+    for extra in (["-c:a", "copy"], []):
+        command = [ffmpeg, *shlex.split(before), "-i", track.source, "-vn", *extra, "-y", target]
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=90)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("seek cut failed for %s: %s", track.title, exc)
+            continue
+        if result.returncode == 0 and os.path.getsize(target) > 0:
+            break
+    else:
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+        log.warning("seek cut produced nothing for %s", track.title)
+        return None
+
+    return Track(
+        source=target,
+        title=track.title,
+        requested_by=track.requested_by,
+        duration=track.duration,
+        webpage_url=track.webpage_url,
+        artist=track.artist,
+        thumbnail=track.thumbnail,
+        temp_path=target,
+    )
+
+
 def resolve_track(query: str, requested_by: str) -> Track:
     """Turn a /play argument into a Track.
 
@@ -956,6 +1022,9 @@ class MusicPlayer:
         # Set by /seek, cleared by the playback loop so the same track is
         # queued again instead of moving on.
         self._seek_pending = False
+        # The temporary cut /seek made, swapped in when the loop sees the
+        # pending flag.
+        self._seek_replacement: Track | None = None
         # Makes /skip ignore song-loop for one round so skip still advances.
         self._skip_once = False
         # Last few titles, used by autoplay to avoid instantly repeating.
@@ -985,6 +1054,9 @@ class MusicPlayer:
 
     def stop(self) -> None:
         """Clear the queue and halt the playback loop. Does not disconnect."""
+        for track in self.queue:
+            if track.temp_path:
+                track.cleanup()
         self.queue.clear()
         self.current = None
         if self._task and not self._task.done():
@@ -1017,13 +1089,21 @@ class MusicPlayer:
             return 0
         return max(0, int(time.monotonic() - self.started_at))
 
-    def seek(self, seconds: int) -> bool:
-        """Restart the current track at `seconds`. Needs a track to seek in."""
+    async def seek(self, seconds: int) -> bool:
+        """Restart the current track at `seconds`.
+
+        Cuts a temporary file copy of the audio in a thread while the song
+        keeps playing, then swaps it in - so the seek never depends on a CDN
+        answering a remote byte-range request.
+        """
         if self.current is None or not self.voice.is_connected():
             return False
-        self.current.seek_offset = max(0, seconds)
+        clip = await asyncio.to_thread(_cut_track, self.current, max(0, seconds))
+        if clip is None:
+            return False
         self._seek_pending = True
-        # Stopping makes _play_one return, and the loop re-queues this track.
+        self._seek_replacement = clip
+        # Stopping makes _play_one return, and the loop re-queues the clip.
         self.voice.stop()
         return True
 
@@ -1038,10 +1118,12 @@ class MusicPlayer:
                 track = self.queue.pop(0)
                 ok = await self._play_one(track)
 
-                # /seek stopped this track on purpose - play it again from
-                # the new position instead of moving on.
+                # /seek stopped this track on purpose - swap in the cut
+                # portion and play on from the new position.
                 if self._seek_pending:
                     self._seek_pending = False
+                    track = self._seek_replacement or track
+                    self._seek_replacement = None
                     self.queue.insert(0, track)
                     continue
 
@@ -1092,17 +1174,18 @@ class MusicPlayer:
         self.current = track
         log.info("playing %s", track.title)
 
-        before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-        if track.seek_offset:
-            # -ss before the input seeks fast instead of decoding from zero.
-            before_options += f" -ss {track.seek_offset}"
-            track.seek_offset = 0
-        if track.headers:
-            # FFmpeg's default UA gets rejected by most CDNs, so replay the
-            # exact headers yt-dlp said go with this stream.
-            pairs = [f"{key}: {value}" for key, value in track.headers.items()]
-            header_blob = "\r\n".join(pairs) + "\r\n"
-            before_options += " -headers " + shlex.quote(header_blob)
+        before_options = ""
+        if track.is_stream:
+            # Only networks need the reconnect flags - FFmpeg rejects them for
+            # local files (that includes the temporary /seek cut), so clips
+            # stay on the plain-path branch.
+            before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+            if not track.temp_path and track.headers:
+                # FFmpeg's default UA gets rejected by most CDNs, so replay
+                # the exact headers yt-dlp said go with this stream.
+                pairs = [f"{key}: {value}" for key, value in track.headers.items()]
+                header_blob = "\r\n".join(pairs) + "\r\n"
+                before_options += " -headers " + shlex.quote(header_blob)
 
         try:
             # FFmpegOpusAudio reads a local path or pulls a URL -
@@ -1156,6 +1239,10 @@ class MusicPlayer:
             )
 
         self.current = None
+        # The cut file is only good for this one play-through - throw it away
+        # unless song/queue loop wants to replay it.
+        if track.temp_path and self.loop_mode == "off":
+            track.cleanup()
         return error is None
 
     def _apply_loop(self, track: Track) -> None:
@@ -1764,7 +1851,7 @@ class Music(commands.Cog):
             )
             return
 
-        if not player.seek(seconds):
+        if not await player.seek(seconds):
             await interaction.response.send_message("Couldn't seek right now. Try again.")
             return
         await interaction.response.send_message(
