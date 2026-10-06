@@ -2,8 +2,8 @@
 
 A personal Discord music bot: one command plays a song in your voice channel.
 It plays matching files from `music/`, and for anything else it searches
-**JioSaavn** (320k) first, then **SoundCloud** and **YouTube** — which is also
-what a pasted link uses.
+**YouTube** first, then **JioSaavn** (320k) and **SoundCloud** (128k) — which
+is also what a pasted link uses.
 
 Built for my own private server.
 
@@ -11,8 +11,10 @@ Built for my own private server.
 
 - Join and leave voice channels
 - Play local audio files from the `music/` folder
-- Songs from the internet: **JioSaavn** first (320k, about 1s, no account,
-  no bot check), then **SoundCloud** (128k), then **YouTube** through yt-dlp
+- Songs from the internet: **YouTube** first through yt-dlp (with a po-token
+  provider, so data-centre playback does not get "sign in to confirm you're
+  not a bot"), then **JioSaavn** (320k, about 1s, no account, no bot check),
+  then **SoundCloud** (128k)
   - which is what a pasted YouTube or SoundCloud link uses
 - Pause, resume, skip and stop
 - Per-server queue with automatic advance to the next song

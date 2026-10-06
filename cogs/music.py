@@ -467,14 +467,44 @@ log.info("ffmpeg: %s", find_ffmpeg() or "MISSING")
 
 
 
-_POT_SCRIPT = config.BASE_DIR / "potprovider" / "server" / "build" / "generate_once.js"
-if _POT_SCRIPT.exists() and _NODE:
+_POT_HOME = config.BASE_DIR / "potprovider" / "server"
+if _POT_HOME.exists() and _NODE:
     YDL_OPTIONS["extractor_args"] = {
-        "youtubepot-bgutilscript": {"server_home": str(_POT_SCRIPT.parents[1])}
+        "youtubepot-bgutilscript": {"server_home": str(_POT_HOME)},
+        "youtube": {"pot_trace": "true"},
     }
-    log.info("po-token provider: %s", _POT_SCRIPT.parents[1])
+    log.info("po-token provider: %s (%s)", _POT_HOME, _NODE)
 else:
     log.warning("po-token provider not available - YouTube may ask us to sign in")
+
+
+_POT_BOOSTED = False
+
+
+def _boost_pot_provider() -> None:
+    """Make bgutil:script-node the preferred po-token provider."""
+    global _POT_BOOSTED
+    if _POT_BOOSTED:
+        return
+    _POT_BOOSTED = True
+    try:
+        from yt_dlp.extractor.youtube.pot import _registry as _pot_registry
+        from yt_dlp.extractor.youtube.pot.provider import register_preference
+
+        _node_ptp = next(
+            (
+                cls
+                for cls in _pot_registry._pot_providers.value.values()
+                if getattr(cls, "PROVIDER_NAME", "") == "bgutil:script-node"
+            ),
+            None,
+        )
+        if _node_ptp:
+            register_preference(_node_ptp)(lambda provider, request: 1000)
+        else:
+            log.warning("po-token provider bgutil:script-node not registered")
+    except Exception as exc:
+        log.warning("could not boost po-token provider preference: %s", exc)
 
 
 def _cookie_file(value: str) -> str:
@@ -511,9 +541,9 @@ MAX_RESULTS = 5
 
 YOUTUBE_CLIENT_ATTEMPTS: list[dict] = [
     {},
-    {"extractor_args": {"youtube": {"player_client": ["tv", "web_safari"]}}},
-    {"extractor_args": {"youtube": {"player_client": ["mweb", "android_vr"]}}},
-    {"extractor_args": {"youtube": {"player_client": ["ios", "android"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["tv"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["mweb"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["web_embedded"]}}},
 ]
 
 
@@ -531,6 +561,7 @@ def _merge_options(extra: dict) -> dict:
 def _extract_once(options: dict, query: str) -> dict | None:
     """One yt-dlp extraction - search first, then the full video details."""
     with YoutubeDL(options) as ydl:
+        _boost_pot_provider()
         if is_url(query):
             info = ydl.extract_info(query, download=False)
             if not info:
@@ -743,6 +774,26 @@ def _cut_track(track: Track, seconds: int) -> Track | None:
     )
 
 
+def _youtube_info(query: str) -> tuple[dict | None, Exception | None]:
+    """First usable YouTube/none result for a query across client fallbacks."""
+    last_error: Exception | None = None
+    for attempt, extra in enumerate(YOUTUBE_CLIENT_ATTEMPTS):
+        if attempt:
+            log.info("youtube retry %d with client set %s", attempt, extra["extractor_args"])
+        started = time.monotonic()
+        try:
+            return _extract_once(_merge_options(extra), query), None
+        except DownloadError as exc:
+            last_error = exc
+            log.warning(
+                "youtube client attempt %d failed after %.1fs: %s",
+                attempt,
+                time.monotonic() - started,
+                reason_line(exc),
+            )
+    return None, last_error
+
+
 def resolve_track(query: str, requested_by: str) -> Track:
     """Turn a /play argument into a Track."""
     query = query.strip()
@@ -757,47 +808,38 @@ def resolve_track(query: str, requested_by: str) -> Track:
     if path is not None:
         return Track.from_file(path, requested_by)
 
-    if not is_url(query):
-        jsaavn_info = _jiosaavn_info(query)
-        if jsaavn_info:
-            try:
-                return _build_track(jsaavn_info, query, requested_by)
-            except LookupError:
-                log.warning("jiosaavn had no playable stream for %r", query)
+    if is_url(query):
+        info, last_error = _youtube_info(query)
+        if info is None:
+            if last_error is None:
+                raise LookupError("no results")
+            raise last_error
+        return _build_track(info, query, requested_by)
 
-        sc_info = _soundcloud_info(query)
-        if sc_info:
-            try:
-                return _build_track(sc_info, query, requested_by)
-            except LookupError:
-                log.warning("soundcloud had no playable stream for %r", query)
-
-    info: dict | None = None
-    last_error: Exception | None = None
-    for attempt, extra in enumerate(YOUTUBE_CLIENT_ATTEMPTS):
-        if attempt:
-            log.info("retrying with client set %s", extra["extractor_args"])
-        started = time.monotonic()
+    info, last_error = _youtube_info(query)
+    if info is not None:
         try:
-            info = _extract_once(_merge_options(extra), query)
-            break
-        except DownloadError as exc:
+            return _build_track(info, query, requested_by)
+        except LookupError:
+            log.warning("youtube had no playable stream for %r", query)
 
+    jsaavn_info = _jiosaavn_info(query)
+    if jsaavn_info:
+        try:
+            return _build_track(jsaavn_info, query, requested_by)
+        except LookupError:
+            log.warning("jiosaavn had no playable stream for %r", query)
 
-            last_error = exc
-            log.warning(
-                "client attempt %d failed after %.1fs: %s",
-                attempt,
-                time.monotonic() - started,
-                reason_line(exc),
-            )
+    sc_info = _soundcloud_info(query)
+    if sc_info:
+        try:
+            return _build_track(sc_info, query, requested_by)
+        except LookupError:
+            log.warning("soundcloud had no playable stream for %r", query)
 
-    if info is None:
-        if last_error is None:
-            raise LookupError("no results")
+    if last_error is not None:
         raise last_error
-
-    return _build_track(info, query, requested_by)
+    raise LookupError("no results")
 
 
 def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
