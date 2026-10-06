@@ -27,6 +27,8 @@ FFMPEG_FALLBACK_PATHS = (
     Path("C:/ffmpeg/bin"),
     Path("C:/Program Files/ffmpeg/bin"),
     Path("C:/ProgramData/chocolatey/bin"),
+    # heroku-buildpack-ffmpeg-static unpacks here on a Linux dyno
+    Path("/app/vendor/ffmpeg/bin"),
 )
 
 FFMPEG_MISSING = (
