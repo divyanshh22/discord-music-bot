@@ -108,13 +108,16 @@ async def on_command_error(ctx, error):
 
 
 async def main():
-    async with client:
-        await load_cogs()
-        # Health server first: if the database is slow to answer we still
-        # answer Render's health checks instead of failing the deploy.
-        await start_health_server()
-        await db.connect(config.DATABASE_URL)
-        await client.start(config.TOKEN)
+    try:
+        async with client:
+            await load_cogs()
+            # Health server first: if the database is slow to answer we still
+            # answer Render's health checks instead of failing the deploy.
+            await start_health_server()
+            await db.connect(config.DATABASE_URL)
+            await client.start(config.TOKEN)
+    finally:
+        await db.close()
 
 
 if __name__ == "__main__":
