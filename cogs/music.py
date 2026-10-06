@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import random
@@ -8,6 +9,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -362,6 +364,36 @@ if _POT_SCRIPT.exists() and _NODE:
     log.info("po-token provider: %s", _POT_SCRIPT.parents[1])
 else:
     log.warning("po-token provider not available - YouTube may ask us to sign in")
+
+
+def _cookie_file(value: str) -> str:
+    """Turn YOUTUBE_COOKIES into a path yt-dlp can read.
+
+    Accepts either a path to a cookies.txt (handy on our own machine) or the
+    file's base64, because Render's environment variables are single-line.
+    """
+    raw = value.strip()
+    path = Path(raw)
+    if path.is_file():
+        return str(path)
+
+    target = Path(tempfile.gettempdir()) / "case_youtube_cookies.txt"
+    target.write_bytes(base64.b64decode(raw))
+    return str(target)
+
+
+# A PO token alone rarely satisfies YouTube from a data-centre IP - its own
+# docs say to add cookies as well. Off unless YOUTUBE_COOKIES is set, so a
+# home connection needs nothing.
+_COOKIES = os.getenv("YOUTUBE_COOKIES")
+if _COOKIES:
+    try:
+        YDL_OPTIONS["cookiefile"] = _cookie_file(_COOKIES)
+        log.info("youtube cookies: %s", YDL_OPTIONS["cookiefile"])
+    except Exception as exc:
+        log.warning("YOUTUBE_COOKIES could not be read: %s", exc)
+else:
+    log.info("youtube cookies: none set")
 
 MAX_RESULTS = 5
 
