@@ -185,26 +185,22 @@ YouTube challenges data-centre IPs (Render, a VPS) with *"Sign in to confirm
 you're not a bot"*, and yt-dlp cannot answer that on its own.
 `bgutil-ytdlp-pot-provider` supplies the proof-of-origin token. The plugin
 itself comes from `requirements.txt`; the token generator is a node.js app.
-Render's Python runtime has no node.js by default, so the build command also
-bakes a node binary into the repo (at `node/bin/node`) that the bot finds at
-runtime:
+Render's Python runtime has no node.js by default, so the build also bakes a
+node binary into the repo (at `node/bin/node`) that the bot finds at runtime.
+The whole setup lives in `render-build.sh` - the Build Command is just:
 
 ```bash
-pip install -r requirements.txt
-rm -rf potprovider node
-git clone --depth 1 --single-branch --branch 2.0.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git potprovider
-cd potprovider/server && (npm ci || npm install) && npx tsc && cd ../..
-curl -fsSL -o node.tar.xz https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz
-tar -xJf node.tar.xz && mv node-v22.12.0-linux-x64 node && rm node.tar.xz
+bash render-build.sh
 ```
 
 The `rm -rf` matters: Render's build cache kept a `potprovider/` without its
 `package-lock.json`, and `npm ci` refuses to run without one.
 
-Paste all of that as the service's **Build Command** (Settings → Build &
-Deploy). After a deploy, `bot.py` logs `po-token provider: .../potprovider/server`.
-Without it, or without node, YouTube links fail with *"Sign in to confirm
-you're not a bot"* from a flagged IP.
+Put `bash render-build.sh` as the service's **Build Command** (Settings →
+Build & Deploy). After a deploy, `bot.py` logs
+`po-token provider: .../potprovider/server`. Without it, or without node,
+YouTube links fail with *"Sign in to confirm you're not a bot"* from a
+flagged IP.
 
 ### YouTube cookies (optional but strongest)
 
