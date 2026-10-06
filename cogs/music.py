@@ -7,6 +7,7 @@ import random
 import re
 import shlex
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -79,6 +80,17 @@ def find_node() -> str | None:
             return str(candidate)
 
     return None
+
+
+def _node_version(path: str) -> str:
+    """`v22.4.0` - bgutil's script needs node 22+, so log what we actually have."""
+    try:
+        out = subprocess.run(
+            [path, "--version"], capture_output=True, text=True, timeout=10
+        )
+        return (out.stdout or out.stderr).strip() or "unknown version"
+    except Exception:
+        return "unknown version"
 
 
 def normalize(text: str) -> str:
@@ -290,7 +302,12 @@ class _YDLLogger:
     """
 
     def debug(self, msg: str) -> None:
-        log.debug("yt-dlp: %s", msg)
+        # yt-dlp hides PO-token progress in debug output, and that is exactly
+        # what we need to see when YouTube starts challenging our IP.
+        if "[pot" in msg or "PO Token" in msg:
+            log.info("yt-dlp: %s", msg)
+        else:
+            log.debug("yt-dlp: %s", msg)
 
     def warning(self, msg: str) -> None:
         log.warning("yt-dlp: %s", msg)
@@ -325,13 +342,26 @@ YDL_OPTIONS = {
 _NODE = find_node()
 if _NODE:
     YDL_OPTIONS["js_runtimes"] = {"node": {"path": _NODE}}
-    log.info("node.js: %s", _NODE)
+    log.info("node.js: %s (%s)", _NODE, _node_version(_NODE))
 else:
     log.warning("node.js not found - some YouTube streams may fail with 403")
 
 # Both are external programs, so check them once at startup instead of
 # discovering a missing one when someone runs /play.
 log.info("ffmpeg: %s", find_ffmpeg() or "MISSING")
+
+# YouTube wants a proof-of-origin token from data-centre IPs, which yt-dlp
+# cannot make on its own. bgutil generates one with node.js; the build clones
+# and compiles it into potprovider/. On a home IP the token is never needed,
+# so a missing provider is only a warning.
+_POT_SCRIPT = config.BASE_DIR / "potprovider" / "server" / "build" / "generate_once.js"
+if _POT_SCRIPT.exists() and _NODE:
+    YDL_OPTIONS["extractor_args"] = {
+        "youtubepot-bgutilscript": {"server_home": str(_POT_SCRIPT.parents[1])}
+    }
+    log.info("po-token provider: %s", _POT_SCRIPT.parents[1])
+else:
+    log.warning("po-token provider not available - YouTube may ask us to sign in")
 
 MAX_RESULTS = 5
 
@@ -345,6 +375,22 @@ YOUTUBE_CLIENT_ATTEMPTS: list[dict] = [
     {"extractor_args": {"youtube": {"player_client": ["tv", "web_safari"]}}},
     {"extractor_args": {"youtube": {"player_client": ["mweb", "android_vr"]}}},
 ]
+
+
+def _merge_options(extra: dict) -> dict:
+    """A copy of YDL_OPTIONS with one fallback attempt applied.
+
+    The attempts only touch `youtube:player_client`, so their extractor_args
+    are merged key-by-key - otherwise the PO-token provider configured above
+    would be thrown away on every retry.
+    """
+    options = {**YDL_OPTIONS, **extra}
+    if "extractor_args" in extra:
+        options["extractor_args"] = {
+            **YDL_OPTIONS.get("extractor_args", {}),
+            **extra["extractor_args"],
+        }
+    return options
 
 
 def _extract_once(options: dict, query: str) -> dict | None:
@@ -404,7 +450,7 @@ def resolve_track(query: str, requested_by: str) -> Track:
             log.info("retrying with client set %s", extra["extractor_args"])
         started = time.monotonic()
         try:
-            info = _extract_once({**YDL_OPTIONS, **extra}, query)
+            info = _extract_once(_merge_options(extra), query)
             break
         except DownloadError as exc:
             # Only a rejected client is worth retrying - our own LookupError

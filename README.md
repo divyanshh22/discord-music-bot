@@ -182,6 +182,21 @@ plan has no background workers) plus a free **PostgreSQL** database.
 CASE listens on `$PORT` so Render's health check passes, and the Discord
 connection itself is outbound, so no extra networking is needed.
 
+### The PO-token provider
+
+YouTube challenges data-centre IPs (Render, a VPS) with *"Sign in to confirm
+you're not a bot"*, and yt-dlp cannot answer that on its own.
+`bgutil-ytdlp-pot-provider` supplies the proof-of-origin token. The plugin
+itself comes from `requirements.txt`; the token generator is a node.js app
+that the build clones and compiles into `potprovider/`:
+
+```bash
+pip install -r requirements.txt && (test -d potprovider || git clone --depth 1 --single-branch --branch 2.0.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git potprovider) && cd potprovider/server && npm ci && npx tsc
+```
+
+Paste that as the service's **Build Command** (Settings → Build & Deploy).
+CASE runs fine without it - it just cannot play from a flagged IP.
+
 Free-tier caveats: the web service spins down after ~15 min of no HTTP
 traffic, and the free Postgres database expires after 30 days.
 

@@ -12,3 +12,7 @@ yt-dlp>=2024.1.0
 
 # PostgreSQL, only used when DATABASE_URL is set (Render, production)
 asyncpg>=0.29,<1.0
+
+# Generates the proof-of-origin token YouTube demands from data-centre IPs.
+# The potprovider/ server it talks to is cloned + compiled by the build.
+bgutil-ytdlp-pot-provider==2.0.1
