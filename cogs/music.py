@@ -786,7 +786,7 @@ def _is_bot_check(exc: Exception) -> bool:
     return "sign in to confirm" in message or "not a bot" in message
 
 
-_YOUTUBE_TEXT_TIMEOUT = 2.0
+_YOUTUBE_TEXT_TIMEOUT = float(os.getenv("YOUTUBE_TIMEOUT", "2.0"))
 _AUTO = object()
 
 
@@ -853,11 +853,6 @@ async def resolve_track(query: str, requested_by: str) -> Track:
             return _build_track(info, query, requested_by)
         except LookupError:
             log.warning("youtube had no playable stream for %r", query)
-
-    if _COOKIES:
-        if last_error is not None:
-            raise last_error
-        raise LookupError("youtube had no playable result for this query")
 
     jsaavn_info = await asyncio.to_thread(_jiosaavn_info, query)
     if jsaavn_info:
