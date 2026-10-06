@@ -8,7 +8,7 @@ class General(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @discord.app_commands.command(name="ping", description="Check how responsive CASE is.")
+    @discord.app_commands.command(name="ping", description="Check how responsive Audira is.")
     async def ping(self, interaction: discord.Interaction):
         latency = round(self.bot.latency * 1000)
         colour = discord.Colour.green() if latency < 200 else discord.Colour.red()
@@ -20,10 +20,10 @@ class General(commands.Cog):
             )
         )
 
-    @discord.app_commands.command(name="help", description="Show all CASE commands.")
+    @discord.app_commands.command(name="help", description="Show all Audira commands.")
     async def help(self, interaction: discord.Interaction):
         embed = discord.Embed(
-            title="CASE Commands",
+            title="Audira Commands",
             colour=discord.Colour.blurple(),
         )
         embed.add_field(
@@ -60,7 +60,7 @@ class General(commands.Cog):
             value="`/join` — join your voice channel\n`/leave` — leave the voice channel",
             inline=False,
         )
-        embed.set_footer(text="/play searches YouTube, or plays a matching file from music/.")
+        embed.set_footer(text="/play searches JioSaavn and YouTube, or plays a matching file from music/.")
         await interaction.response.send_message(embed=embed)
 
 

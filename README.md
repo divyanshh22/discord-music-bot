@@ -1,4 +1,4 @@
-# CASE
+# Audira
 
 A personal Discord music bot I built to learn Discord bot development from the ground up.
 It plays local audio files, so you can actually see how the voice/audio layer works
@@ -79,10 +79,10 @@ sudo apt install ffmpeg      # Debian/Ubuntu
 ## Discord bot setup
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
-2. **Create Application** → name it `CASE`
+2. **Create Application** → name it `Audira`
 3. On the **Bot** tab → **Reset Token** → copy it (you only see it once)
-4. No privileged intents needed. CASE uses slash commands only.
-5. Invite CASE using the OAuth2 URL Generator:
+4. No privileged intents needed. Audira uses slash commands only.
+5. Invite Audira using the OAuth2 URL Generator:
 
    - Scopes: `bot` + `applications.commands`
    - Permissions: `View Channels`, `Send Messages`, `Connect`, `Speak`, `Use Voice Activity`
@@ -116,7 +116,7 @@ venv\Scripts\activate
 python bot.py
 ```
 
-On startup CASE logs that it's online and syncs slash commands. Discord can take
+On startup Audira logs that it's online and syncs slash commands. Discord can take
 up to an hour to propagate new global commands, but they normally appear within
 seconds.
 
@@ -163,8 +163,8 @@ music/
 
 ## Notes and known limits
 
-- The queue lives in memory. Restart CASE and it's gone.
-- When the queue empties, CASE leaves the voice channel on its own.
+- The queue lives in memory. Restart Audira and it's gone.
+- When the queue empties, CASE stays in the channel - only `/stop` makes it leave.
 - `music/` is read once per `/play`, so new files work without a restart.
 - `/history` only works when `DATABASE_URL` is set. Locally the bot runs fine
   without one and just says history is off.
@@ -181,7 +181,7 @@ plan has no background workers) plus a free **PostgreSQL** database.
 4. Deploy. Render creates `case-db` and passes its connection string to the
    bot as `DATABASE_URL` automatically.
 
-CASE listens on `$PORT` so Render's health check passes, and the Discord
+Audira listens on `$PORT` so Render's health check passes, and the Discord
 connection itself is outbound, so no extra networking is needed.
 
 ### The PO-token provider
@@ -200,7 +200,7 @@ The `rm -rf` matters: Render's build cache kept a `potprovider/` without its
 `package-lock.json`, and `npm ci` refuses to run without one.
 
 Paste that as the service's **Build Command** (Settings → Build & Deploy).
-CASE runs fine without it - it just cannot play from a flagged IP.
+Audira runs fine without it - it just cannot play from a flagged IP.
 
 Free-tier caveats: the web service spins down after ~15 min of no HTTP
 traffic, and the free Postgres database expires after 30 days.

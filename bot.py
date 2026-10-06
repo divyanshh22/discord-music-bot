@@ -38,7 +38,7 @@ async def start_health_server() -> None:
                 line = await asyncio.wait_for(reader.readline(), timeout=5)
                 if not line or line in (b"\r\n", b"\n"):
                     break
-            body = b"CASE is online"
+            body = b"Audira is online"
             writer.write(
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: text/plain\r\n"
@@ -69,7 +69,7 @@ async def load_cogs():
 
 @client.event
 async def on_ready():
-    log.info("CASE is online as %s (ID: %s)", client.user, client.user.id)
+    log.info("Audira is online as %s (ID: %s)", client.user, client.user.id)
     log.info("connected to %s guild(s)", len(client.guilds))
     log.info("connected listeners: %s", len(client.extra_events))
 

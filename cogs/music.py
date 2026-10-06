@@ -41,7 +41,7 @@ FFMPEG_FALLBACK_PATHS = (
 
 FFMPEG_MISSING = (
     "FFmpeg isn't installed, so I can't play audio. "
-    "Install FFmpeg and restart CASE."
+    "Install FFmpeg and restart Audira."
 )
 
 
@@ -1104,7 +1104,7 @@ class Music(commands.Cog):
     async def leave(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild)
         if player is None:
-            await interaction.response.send_message("CASE isn't connected to a voice channel.")
+            await interaction.response.send_message("Audira isn't connected to a voice channel.")
             return
         del self.players[interaction.guild.id]
         await player.shutdown()
@@ -1168,7 +1168,7 @@ class Music(commands.Cog):
             log.warning("voice connect timed out for %r", label)
             await self._discard_voice(interaction.guild)
             await interaction.followup.send(
-                "CASE took too long to join the voice channel. Try again."
+                "Audira took too long to join the voice channel. Try again."
             )
             return
         if error:
@@ -1347,7 +1347,7 @@ class Music(commands.Cog):
             await interaction.response.send_message("Nothing is playing right now.")
             return
 
-        embed = discord.Embed(title="CASE Queue", colour=discord.Colour.blurple())
+        embed = discord.Embed(title="Audira Queue", colour=discord.Colour.blurple())
         embed.add_field(
             name="Now Playing",
             value=player.current.title if player.current else "—",
@@ -1507,7 +1507,7 @@ class Music(commands.Cog):
     async def history(self, interaction: discord.Interaction):
         if not db.available():
             await interaction.response.send_message(
-                "Play history isn't enabled - CASE is running without a database."
+                "Play history isn't enabled - Audira is running without a database."
             )
             return
 
@@ -1533,7 +1533,7 @@ class Music(commands.Cog):
     def _now_playing_embed(self, track: Track, player: MusicPlayer) -> discord.Embed:
         status = "Paused" if player.is_paused else "Playing"
         embed = discord.Embed(
-            title=f"CASE {status}",
+            title=f"Audira {status}",
             description=f"Now playing **{track.title}**",
             colour=discord.Colour.blurple(),
         )
