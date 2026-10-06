@@ -164,23 +164,89 @@ def reason_line(exc: Exception) -> str:
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
 
 
-async def fetch_lyrics(query: str) -> dict | None:
-    """Best match for `query` from lrclib.net - free, no API key needed.
+def _lyrics_key(text: str) -> str:
+    """Letters and digits only, so 'Hale Dil (From Murder)' compares cleanly."""
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
 
-    Returns the raw result (it has plainLyrics/artistName/...) or None.
+
+def lyrics_score(item: dict, title: str, artist: str | None, duration: int | None) -> int:
+    """Confidence that `item` is the same song. 0 means "not this song".
+
+    lrclib's search is loose, so the first hit is often a different track
+    entirely. A score of 3+ needs the titles to match (equal or one inside
+    the other); artist and duration only break ties between close matches.
+    """
+    want, got = _lyrics_key(title), _lyrics_key(item.get("trackName") or "")
+    if not want or not got:
+        return 0
+    if want == got:
+        score = 5
+    elif want in got or got in want:
+        score = 3
+    else:
+        return 0
+
+    if artist:
+        theirs = _lyrics_key(item.get("artistName") or "")
+        ours = _lyrics_key(artist)
+        if theirs and ours and (ours in theirs or theirs in ours):
+            score += 3
+        elif theirs and ours:
+            score -= 1
+
+    their_duration = item.get("duration")
+    if duration and their_duration:
+        diff = abs(int(their_duration) - int(duration))
+        if diff <= 5:
+            score += 3
+        elif diff <= 15:
+            score += 1
+        elif diff > 30:
+            score -= 2
+
+    return score
+
+
+async def fetch_lyrics(
+    query: str, *, artist: str | None = None, duration: int | None = None
+) -> dict | None:
+    """Best matching lyrics for `query` from lrclib.net - free, no API key.
+
+    Returns the raw result (it has plainLyrics/artistName/...) or None when
+    nothing looks like the same song - a wrong answer is worse than none.
     """
     timeout = aiohttp.ClientTimeout(total=10)
+    results: list = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(LRCLIB_SEARCH, params={"q": query}) as resp:
-            if resp.status != 200:
-                log.warning("lrclib returned HTTP %s", resp.status)
-                return None
-            results = await resp.json()
+        # lrclib answers 503 now and then; a couple of retries turns most of
+        # those "couldn't find lyrics" moments into results.
+        for attempt in range(3):
+            try:
+                async with session.get(LRCLIB_SEARCH, params={"q": query}) as resp:
+                    if resp.status == 200:
+                        results = await resp.json()
+                        break
+                    log.warning("lrclib returned HTTP %s", resp.status)
+            except aiohttp.ClientError as exc:
+                log.warning("lrclib request failed: %s", exc)
+            if attempt < 2:
+                await asyncio.sleep(1.5 * (attempt + 1))
 
+    if not results:
+        return None
+
+    best: dict | None = None
+    best_score = 0
     for item in results:
-        if item.get("plainLyrics"):
-            return item
-    return None
+        if not item.get("plainLyrics"):
+            continue
+        score = lyrics_score(item, query, artist, duration)
+        if score > best_score:
+            best, best_score = item, score
+
+    if best is not None:
+        log.info("lyrics %r -> %r (score %d)", query, best.get("trackName"), best_score)
+    return best
 
 
 # Sites that never hand over playable audio - either they only expose
@@ -267,6 +333,7 @@ class Track:
         webpage_url: str | None = None,
         headers: dict[str, str] | None = None,
         artist: str | None = None,
+        thumbnail: str | None = None,
     ):
         self.source = source
         self.title = title
@@ -279,6 +346,11 @@ class Track:
         # Who made it, when the source says so. Autoplay leans on this to
         # find something in the same lane as the song that just ended.
         self.artist = artist
+        # Cover art for the now-playing card, when the source provides one.
+        self.thumbnail = thumbnail
+        # True when a command already posted the now-playing card for this
+        # track, so starting it does not post a second one.
+        self.announced = False
         # Seconds to skip to when this track starts - set by /seek, consumed
         # by _play_one so the restart plays from that point.
         self.seek_offset = 0
@@ -537,6 +609,9 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
         artist = artist.strip() or None
     else:
         artist = None
+    thumbnail = info.get("thumbnail")
+    if thumbnail and not isinstance(thumbnail, str):
+        thumbnail = None
 
     return Track(
         source=url,
@@ -546,6 +621,7 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
         webpage_url=info.get("webpage_url"),
         headers=info.get("http_headers") or {},
         artist=artist,
+        thumbnail=thumbnail,
     )
 
 
@@ -664,6 +740,56 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     if not results:
         raise LookupError("no results")
     return results
+
+
+def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
+    """The card posted whenever a song starts - used by commands and by the
+    playback loop itself, so every song gets the same treatment."""
+    status = "Paused" if player.is_paused else "Playing"
+    embed = discord.Embed(
+        title=f"Audira {status}",
+        description=f"Now playing **{track.title}**",
+        colour=discord.Colour.blurple(),
+    )
+    source = "stream" if track.is_stream else "local file"
+    embed.add_field(
+        name="Details",
+        value=f"{source} · {track.duration_label()}",
+        inline=True,
+    )
+    embed.add_field(name="Requested by", value=track.requested_by, inline=True)
+
+    if track.duration:
+        elapsed = min(player.elapsed(), track.duration)
+        embed.add_field(
+            name="Progress",
+            value=(
+                f"`{elapsed // 60}:{elapsed % 60:02d}` "
+                f"{progress_bar(elapsed, track.duration)} "
+                f"`{track.duration_label()}`"
+            ),
+            inline=False,
+        )
+
+    flags = []
+    if player.loop_mode != "off":
+        flags.append(f"loop: {player.loop_mode}")
+    if player.autoplay:
+        flags.append("autoplay")
+    if flags:
+        embed.add_field(name="Modes", value=" · ".join(flags), inline=True)
+
+    if track.thumbnail:
+        embed.set_thumbnail(url=track.thumbnail)
+    if track.webpage_url:
+        embed.url = track.webpage_url
+    if player.queue:
+        embed.add_field(
+            name=f"Queue ({len(player.queue)})",
+            value=", ".join(t.title for t in player.queue[:5]),
+            inline=False,
+        )
+    return embed
 
 
 class MusicPlayer:
@@ -859,6 +985,10 @@ class MusicPlayer:
             self.current = None
             return False
 
+        # The queue advances on its own after a skip or an autoplay pick, so
+        # this is where most songs get their card posted.
+        self._announce(track)
+
         # poll until the track ends, a skip happens, or stop() cancels us
         self.started_at = time.monotonic()
         while self.voice.is_playing() or self.voice.is_paused():
@@ -1004,6 +1134,28 @@ class MusicPlayer:
         """Best-effort notice in the channel that started playback."""
         if self.notify_channel:
             asyncio.create_task(self.notify_channel.send(message))
+
+    def _announce(self, track: Track) -> None:
+        """Post the now-playing card when a song starts on its own.
+
+        Commands already post it when they start a song directly, which is
+        what `track.announced` marks - everything else (queue advancing,
+        /skip, autoplay) gets the card from here.
+        """
+        if track.announced:
+            track.announced = False
+            return
+        if self.notify_channel is None:
+            return
+        embed = build_now_playing_embed(track, self)
+
+        async def send() -> None:
+            try:
+                await self.notify_channel.send(embed=embed)
+            except Exception:
+                log.warning("could not post the now-playing card", exc_info=True)
+
+        asyncio.create_task(send())
 
 
 class SearchPicker(discord.ui.View):
@@ -1238,6 +1390,10 @@ class Music(commands.Cog):
 
         was_idle = player.is_idle()
         player.notify_channel = interaction.channel
+        if was_idle:
+            # This reply carries the now-playing card, so the playback loop
+            # won't post a second one for the same track.
+            track.announced = True
         player.add(track)
 
         if was_idle:
@@ -1502,26 +1658,44 @@ class Music(commands.Cog):
     )
     async def lyrics(self, interaction: discord.Interaction, query: str | None = None):
         player = self.get_player(interaction.guild)
-        if query is None:
+        title = query
+        artist: str | None = None
+        duration: int | None = None
+
+        if title is None:
             if player is None or player.current is None:
                 await interaction.response.send_message(
                     "Nothing is playing - try `/lyrics brown rang` instead."
                 )
                 return
-            query = player.current.title
+            title = player.current.title
+
+        if player is not None and player.current is not None:
+            # When the query is the song on right now, use its metadata too so
+            # duration and artist can rule out look-alike tracks.
+            if _lyrics_key(title) == _lyrics_key(player.current.title):
+                artist = player.current.artist
+                duration = player.current.duration
 
         await interaction.response.defer()
 
         # YouTube titles carry junk like "| Artist" and "(Official Video)".
-        # lrclib matches better on a trimmed version, so try the full one first.
-        trimmed = re.split(r"\s+\|\s+|\s+-\s+", query)[0].strip()
+        # lrclib matches better on a trimmed version, so try both.
+        trimmed = re.split(r"\s+\|\s+|\s+-\s+", title)[0].strip()
+        attempts = [title]
+        if trimmed and trimmed.lower() != title.lower():
+            attempts.append(trimmed)
+        if artist:
+            attempts.append(f"{trimmed} {artist}")
 
-        item = await fetch_lyrics(query)
-        if item is None and trimmed and trimmed.lower() != query.lower():
-            item = await fetch_lyrics(trimmed)
+        item = None
+        for attempt in attempts:
+            item = await fetch_lyrics(attempt, artist=artist, duration=duration)
+            if item is not None:
+                break
 
         if item is None:
-            await interaction.followup.send(f"I couldn't find lyrics for **{query}**.")
+            await interaction.followup.send(f"I couldn't find lyrics for **{title}**.")
             return
 
         text = item["plainLyrics"].strip()
@@ -1591,49 +1765,7 @@ class Music(commands.Cog):
         await interaction.followup.send(embed=embed)
 
     def _now_playing_embed(self, track: Track, player: MusicPlayer) -> discord.Embed:
-        status = "Paused" if player.is_paused else "Playing"
-        embed = discord.Embed(
-            title=f"Audira {status}",
-            description=f"Now playing **{track.title}**",
-            colour=discord.Colour.blurple(),
-        )
-        source = "stream" if track.is_stream else "local file"
-        embed.add_field(
-            name="Details",
-            value=f"{source} · {track.duration_label()}",
-            inline=True,
-        )
-        embed.add_field(name="Requested by", value=track.requested_by, inline=True)
-
-        if track.duration:
-            elapsed = min(player.elapsed(), track.duration)
-            embed.add_field(
-                name="Progress",
-                value=(
-                    f"`{elapsed // 60}:{elapsed % 60:02d}` "
-                    f"{progress_bar(elapsed, track.duration)} "
-                    f"`{track.duration_label()}`"
-                ),
-                inline=False,
-            )
-
-        flags = []
-        if player.loop_mode != "off":
-            flags.append(f"loop: {player.loop_mode}")
-        if player.autoplay:
-            flags.append("autoplay")
-        if flags:
-            embed.add_field(name="Modes", value=" · ".join(flags), inline=True)
-
-        if track.webpage_url:
-            embed.url = track.webpage_url
-        if player.queue:
-            embed.add_field(
-                name=f"Queue ({len(player.queue)})",
-                value=", ".join(t.title for t in player.queue[:5]),
-                inline=False,
-            )
-        return embed
+        return build_now_playing_embed(track, player)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
