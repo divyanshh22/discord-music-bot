@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -125,11 +124,11 @@ def parse_timestamp(text: str) -> int:
 
 
 def progress_bar(elapsed: int, total: int, width: int = 20) -> str:
-    """A compact slider like `------*-------------` for embeds."""
+    """A compact slider like `████░░░░░░░░░░░░░░░░░` for embeds."""
     if not total:
-        return "ΓÖ¬" * width
+        return "░" * width
     filled = max(0, min(width, round(width * elapsed / total)))
-    return "Γûô" * filled + "Γûæ" * (width - filled)
+    return "█" * filled + "░" * (width - filled)
 
 
 def short_duration(seconds: int | None) -> str:
@@ -155,9 +154,6 @@ def reason_line(exc: Exception) -> str:
             text = lines[-1]
     if text.startswith("ERROR:"):
         text = text[6:].strip()
-    lowered = text.lower()
-    if "sign in to confirm" in lowered or "not a bot" in lowered:
-        text += " | the po-token provider or YOUTUBE_COOKIES is missing on this deploy"
     return text[:200].replace("`", "'")
 
 
@@ -509,31 +505,6 @@ def _boost_pot_provider() -> None:
         log.warning("could not boost po-token provider preference: %s", exc)
 
 
-def _cookie_file(value: str) -> str:
-    """Turn YOUTUBE_COOKIES into a path yt-dlp can read."""
-    raw = value.strip()
-    path = Path(raw)
-    if path.is_file():
-        return str(path)
-
-    target = Path(tempfile.gettempdir()) / "case_youtube_cookies.txt"
-    target.write_bytes(base64.b64decode(raw))
-    return str(target)
-
-
-
-
-
-_COOKIES = os.getenv("YOUTUBE_COOKIES")
-if _COOKIES:
-    try:
-        YDL_OPTIONS["cookiefile"] = _cookie_file(_COOKIES)
-        log.info("youtube cookies: %s", YDL_OPTIONS["cookiefile"])
-    except Exception as exc:
-        log.warning("YOUTUBE_COOKIES could not be read: %s", exc)
-else:
-    log.info("youtube cookies: none set")
-
 MAX_RESULTS = 5
 
 
@@ -786,31 +757,16 @@ def _is_bot_check(exc: Exception) -> bool:
     return "sign in to confirm" in message or "not a bot" in message
 
 
-_YOUTUBE_TEXT_TIMEOUT = float(os.getenv("YOUTUBE_TIMEOUT", "2.0"))
-_AUTO = object()
-
-
-async def _youtube_info(
-    query: str, timeout: object = _AUTO
-) -> tuple[dict | None, Exception | None]:
-    """First usable YouTube result across client fallbacks. `timeout=2` hard-caps fast text replies; `timeout=None` lets a pasted link take as long as it needs; default AUTO is 2s without cookies, unlimited with cookies so a real YouTube search can win."""
-    if timeout is _AUTO:
-        cap: float | None = None if _COOKIES else _YOUTUBE_TEXT_TIMEOUT
-    else:
-        cap = timeout
+async def _youtube_info(query: str) -> tuple[dict | None, Exception | None]:
+    """First usable YouTube result for a pasted link across client fallbacks."""
     last_error: Exception | None = None
     for attempt, extra in enumerate(YOUTUBE_CLIENT_ATTEMPTS):
         if attempt:
             log.info("youtube retry %d with client set %s", attempt, extra["extractor_args"])
         started = time.monotonic()
         try:
-            future = asyncio.to_thread(_extract_once, _merge_options(extra), query)
-            info = await asyncio.wait_for(future, cap) if cap else await future
+            info = await asyncio.to_thread(_extract_once, _merge_options(extra), query)
             return info, None
-        except asyncio.TimeoutError:
-            last_error = DownloadError(f"youtube timed out after {cap}s")
-            log.warning("youtube client attempt %d timed out after %.1fs", attempt, cap)
-            break
         except DownloadError as exc:
             last_error = exc
             log.warning(
@@ -840,19 +796,12 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         return Track.from_file(path, requested_by)
 
     if is_url(query):
-        info, last_error = await _youtube_info(query, timeout=None)
+        info, last_error = await _youtube_info(query)
         if info is None:
             if last_error is None:
                 raise LookupError("no results")
             raise last_error
         return _build_track(info, query, requested_by)
-
-    info, last_error = await _youtube_info(query)
-    if info is not None:
-        try:
-            return _build_track(info, query, requested_by)
-        except LookupError:
-            log.warning("youtube had no playable stream for %r", query)
 
     jsaavn_info = await asyncio.to_thread(_jiosaavn_info, query)
     if jsaavn_info:
@@ -861,15 +810,6 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         except LookupError:
             log.warning("jiosaavn had no playable stream for %r", query)
 
-    sc_info = await asyncio.to_thread(_soundcloud_info, query)
-    if sc_info:
-        try:
-            return _build_track(sc_info, query, requested_by)
-        except LookupError:
-            log.warning("soundcloud had no playable stream for %r", query)
-
-    if last_error is not None:
-        raise last_error
     raise LookupError("no results")
 
 
@@ -943,28 +883,30 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
     status = "Paused" if player.is_paused else "Playing"
     embed = discord.Embed(
         title=f"Audira {status}",
-        description=f"Now playing **{track.title}**",
         colour=discord.Colour.blurple(),
     )
+    embed.description = f"**{track.title}**"
+    if track.artist:
+        embed.description += f"\n*{track.artist}*"
+    if track.webpage_url:
+        embed.url = track.webpage_url
+    if track.thumbnail:
+        embed.set_image(url=track.thumbnail)
+
     role = f"stream {track.quality}" if track.is_stream and track.quality else None
     source = role or ("stream" if track.is_stream else "local file")
-    embed.add_field(
-        name="Details",
-        value=f"{source} · {track.duration_label()}",
-        inline=True,
-    )
-    if track.artist:
-        embed.add_field(name="Artist", value=track.artist[:100], inline=True)
+    embed.add_field(name="Details", value=f"{source} · {track.duration_label()}", inline=True)
     embed.add_field(name="Requested by", value=track.requested_by, inline=True)
 
     if track.duration:
         elapsed = min(player.elapsed(), track.duration)
+        pct = round(elapsed / track.duration * 100) if track.duration else 0
         embed.add_field(
             name="Progress",
             value=(
                 f"`{elapsed // 60}:{elapsed % 60:02d}` "
                 f"{progress_bar(elapsed, track.duration)} "
-                f"`{track.duration_label()}`"
+                f"`{pct}%`"
             ),
             inline=False,
         )
@@ -975,12 +917,8 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
     if player.autoplay:
         flags.append("autoplay")
     if flags:
-        embed.add_field(name="Modes", value=" ┬╖ ".join(flags), inline=True)
+        embed.add_field(name="Modes", value=" | ".join(flags), inline=True)
 
-    if track.thumbnail:
-        embed.set_thumbnail(url=track.thumbnail)
-    if track.webpage_url:
-        embed.url = track.webpage_url
     if player.queue:
         embed.add_field(
             name=f"Queue ({len(player.queue)})",
