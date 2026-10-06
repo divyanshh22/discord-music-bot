@@ -1095,7 +1095,8 @@ class Music(commands.Cog):
     )
     async def play(self, interaction: discord.Interaction, song: str):
         # Resolving a stream can take a few seconds, so acknowledge immediately.
-        await interaction.response.defer(ephemeral=True)
+        # Not ephemeral: everyone should see what got queued (and any error).
+        await interaction.response.defer()
         log.info("play: resolving %r", song)
         started = time.monotonic()
 
