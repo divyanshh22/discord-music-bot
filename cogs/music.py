@@ -356,6 +356,7 @@ class Track:
         thumbnail: str | None = None,
         temp_path: str | None = None,
         start_offset: int = 0,
+        quality: str | None = None,
     ):
         self.source = source
         self.title = title
@@ -377,6 +378,7 @@ class Track:
 
         self.temp_path = temp_path
         self.start_offset = start_offset
+        self.quality = quality
 
     def cleanup(self) -> None:
         """Delete the temporary file backing this track, if there is one."""
@@ -713,6 +715,9 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
     if thumbnail and not isinstance(thumbnail, str):
         thumbnail = None
 
+    bitrate = info.get("abr") or info.get("tbr")
+    quality = f"{round(bitrate)}k" if bitrate else (info.get("format_note") or None)
+
     return Track(
         source=url,
         title=info.get("title") or fallback_title,
@@ -722,8 +727,8 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
         headers=info.get("http_headers") or {},
         artist=artist,
         thumbnail=thumbnail,
+        quality=quality,
     )
-
 
 def _cut_track(track: Track, seconds: int) -> Track | None:
     """Return a temporary file copy of `track` starting at `seconds`."""
@@ -771,6 +776,7 @@ def _cut_track(track: Track, seconds: int) -> Track | None:
         thumbnail=track.thumbnail,
         temp_path=target,
         start_offset=(track.start_offset or 0) + seconds,
+        quality=track.quality,
     )
 
 
@@ -915,10 +921,10 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
         description=f"Now playing **{track.title}**",
         colour=discord.Colour.blurple(),
     )
-    source = "stream" if track.is_stream else "local file"
+    source = track.quality or ("stream" if track.is_stream else "local file")
     embed.add_field(
         name="Details",
-        value=f"{source} ┬╖ {track.duration_label()}",
+        value=f"{source} · {track.duration_label()}",
         inline=True,
     )
     if track.artist:
@@ -985,6 +991,9 @@ class MusicPlayer:
 
         self._recent: list[str] = []
 
+        self._now_message: discord.Message | None = None
+        self._now_task: asyncio.Task | None = None
+
     @property
     def is_playing(self) -> bool:
         return self.voice.is_playing()
@@ -1009,6 +1018,10 @@ class MusicPlayer:
 
     def stop(self) -> None:
         """Clear the queue and halt the playback loop. Does not disconnect."""
+        if self._now_task and not self._now_task.done():
+            self._now_task.cancel()
+        self._now_task = None
+        self._now_message = None
         for track in self.queue:
             if track.temp_path:
                 track.cleanup()
@@ -1161,10 +1174,10 @@ class MusicPlayer:
 
 
 
+        self.started_at = time.monotonic()
         self._announce(track)
 
 
-        self.started_at = time.monotonic()
         while self.voice.is_playing() or self.voice.is_paused():
             await asyncio.sleep(0.5)
 
@@ -1321,21 +1334,41 @@ class MusicPlayer:
             asyncio.create_task(self.notify_channel.send(message))
 
     def _announce(self, track: Track) -> None:
-        """Post the now-playing card when a song starts on its own."""
+        """Start the live now-playing card for a song."""
         if track.announced:
             track.announced = False
             return
         if self.notify_channel is None:
             return
-        embed = build_now_playing_embed(track, self)
+        if self._now_task and not self._now_task.done():
+            self._now_task.cancel()
+        self._now_task = asyncio.create_task(self._now_card(track))
 
-        async def send() -> None:
-            try:
-                await self.notify_channel.send(embed=embed)
-            except Exception:
-                log.warning("could not post the now-playing card", exc_info=True)
-
-        asyncio.create_task(send())
+    async def _now_card(self, track: Track) -> None:
+        """Post the now-playing card and keep its timeline up to date."""
+        try:
+            message = await self.notify_channel.send(embed=build_now_playing_embed(track, self))
+        except Exception:
+            log.warning("could not post the now-playing card", exc_info=True)
+            return
+        self._now_message = message
+        try:
+            while (
+                self.current is track
+                and (self.voice.is_playing() or self.voice.is_paused())
+            ):
+                await asyncio.sleep(2)
+                message = self._now_message
+                if message is None:
+                    break
+                try:
+                    await message.edit(embed=build_now_playing_embed(track, self))
+                except Exception:
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._now_message = None
 
 
 class SearchPicker(discord.ui.View):
