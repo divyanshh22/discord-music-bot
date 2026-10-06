@@ -60,7 +60,9 @@ class General(commands.Cog):
             value="`/join` — join your voice channel\n`/leave` — leave the voice channel",
             inline=False,
         )
-        embed.set_footer(text="/play searches JioSaavn and YouTube, or plays a matching file from music/.")
+        embed.set_footer(
+            text="/play searches SoundCloud, JioSaavn and YouTube, or plays a matching file from music/."
+        )
         await interaction.response.send_message(embed=embed)
 
 

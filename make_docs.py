@@ -483,9 +483,8 @@ if error:
         "The queue is in memory. Restarting CASE loses it.",
         "CASE only runs while the host machine is awake. A VPS is needed for 24/7 use.",
         "Spotify is unsupported: the official API exposes metadata, not playable audio.",
-        "The SoundCloud extractor in yt-dlp currently returns HTTP 404. Other sources "
-        "work; this is an upstream yt-dlp issue, and the failure is caught and reported "
-        "cleanly.",
+        "SoundCloud only surfaces results that match the query - its search is loose, "
+        "so an unrelated track is dropped rather than played.",
         "One MusicPlayer per guild, stored in memory, so state is lost on restart.",
         "No volume, shuffle, loop, or per-track removal yet - planned for v2.",
     ]))

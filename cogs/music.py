@@ -177,17 +177,21 @@ def _words(text: str) -> set[str]:
 def _related_to(candidate: dict, query: str) -> bool:
     """True when a search result really is about what we searched for.
 
-    JioSaavn answers almost any query with something, so autoplay needs to
-    tell a song by this artist apart from one that merely ranks well. The
-    rule is one set of words inside the other: either the result narrows the
-    query (title "Sajni" for a long query) or it repeats it (both "jal" and
-    "band" present), which rules out the loose matches in between.
+    Search APIs answer almost anything with something, so we need to tell a
+    song matching the query apart from one that merely ranks well. Two shared
+    words (or the only one, for a one-word query) is enough - plus any result
+    that is simply a shorter form of the query, so a long YouTube title still
+    matches its own short name. That keeps "hale dil by murder" pointing at
+    "Hale Dil Murder2" while rejecting a song that only contains "band".
     """
     wanted = _words(query)
     found = _words(candidate.get("title")) | _words(candidate.get("artist"))
     if not wanted or not found:
         return False
-    return found <= wanted or wanted <= found
+    if found <= wanted or wanted <= found:
+        return True
+    needed = 1 if len(wanted) == 1 else 2
+    return len(wanted & found) >= needed
 
 
 def lyrics_score(item: dict, title: str, artist: str | None, duration: int | None) -> int:
@@ -603,7 +607,8 @@ def search_jiosaavn(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 def _jiosaavn_info(query: str) -> dict | None:
     """First JioSaavn match for a plain query, fully resolved - or None.
 
-    Any failure just means "let YouTube have a go", so nothing propagates.
+    Any failure just means "let the next source have a go", so nothing
+    propagates.
     """
     try:
         matches = search_jiosaavn(query, limit=1)
@@ -616,6 +621,65 @@ def _jiosaavn_info(query: str) -> dict | None:
     except Exception as exc:
         log.warning("jiosaavn failed for %r: %s", query, reason_line(exc))
         return None
+
+
+def search_soundcloud(query: str, limit: int = MAX_RESULTS) -> list[dict]:
+    """SoundCloud matches for a plain query, in the shape search_candidates uses.
+
+    Results stay flat: a page link is all /search shows and all _extract_once
+    needs later. The search arrives as a playlist, so noplaylist (which /play
+    sets for YouTube links) has to come off. Runs in a thread: it blocks on
+    yt-dlp.
+    """
+    options = {**YDL_OPTIONS, "noplaylist": False, "extract_flat": "in_playlist"}
+    options.pop("playlist_items", None)
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
+
+    results = []
+    for entry in [e for e in (info or {}).get("entries") or [] if e]:
+        url = entry.get("webpage_url") or entry.get("url")
+        if not url or not is_url(url):
+            continue
+        results.append(
+            {
+                "title": entry.get("title") or query,
+                "webpage_url": url,
+                "duration": int(entry.get("duration") or 0) or None,
+            }
+        )
+    return results
+
+
+def _soundcloud_info(query: str, limit: int = 5) -> dict | None:
+    """First usable SoundCloud match for a plain query - or None.
+
+    SoundCloud goes first: it streams happily from a data-centre IP with no
+    sign-in and no bot check. Its search is loose though, so the match has to
+    actually relate to the query - otherwise JioSaavn gets the turn.
+    """
+    try:
+        matches = search_soundcloud(query, limit=limit)
+    except Exception as exc:
+        log.info("soundcloud search failed for %r: %s", query, reason_line(exc))
+        return None
+
+    for match in matches:
+        if not _related_to(match, query):
+            continue
+        try:
+            full = _extract_once(YDL_OPTIONS, match["webpage_url"])
+        except Exception as exc:
+            log.info(
+                "soundcloud: no stream for %r: %s", match["title"], reason_line(exc)
+            )
+            continue
+        if full:
+            log.info("soundcloud: %r -> %s", query, full.get("title"))
+            return full
+
+    log.info("soundcloud: no usable match for %r", query)
+    return None
 
 
 def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
@@ -653,9 +717,9 @@ def resolve_track(query: str, requested_by: str) -> Track:
     """Turn a /play argument into a Track.
 
     Local files win over the internet so you can always play your own
-    versions by name. Plain queries go to JioSaavn first (fast, and it never
-    asks a data-centre IP to sign in), then to yt-dlp for YouTube links and
-    for anything JioSaavn missed.
+    versions by name. Plain queries go to SoundCloud first (no bot check for
+    a data-centre IP), then to JioSaavn, then to yt-dlp - which is also what
+    handles a YouTube or SoundCloud link you paste in yourself.
 
     Blocking, so it must run in a thread.
     """
@@ -672,6 +736,13 @@ def resolve_track(query: str, requested_by: str) -> Track:
         return Track.from_file(path, requested_by)
 
     if not is_url(query):
+        sc_info = _soundcloud_info(query)
+        if sc_info:
+            try:
+                return _build_track(sc_info, query, requested_by)
+            except LookupError:
+                log.warning("soundcloud had no playable stream for %r", query)
+
         jsaavn_info = _jiosaavn_info(query)
         if jsaavn_info:
             try:
@@ -722,44 +793,54 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     if reason:
         raise ValueError(reason)
 
-    options = dict(YDL_OPTIONS)
-    options["extract_flat"] = "in_playlist"
-    # /play sets this to keep playlist links short, but on a ytsearch it would
-    # cap the whole result list at one - which defeats a picker.
-    options.pop("playlist_items", None)
-
+    # Same order as /play, so the picker shows what pressing Enter would do:
+    # SoundCloud, then JioSaavn, and only then YouTube.
     results = []
     try:
-        with YoutubeDL(options) as ydl:
-            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-            entries = [e for e in (info or {}).get("entries", []) if e]
-
-        for entry in entries:
-            url = entry.get("webpage_url") or entry.get("url")
-            if not url:
-                continue
-            if not is_url(url):
-                # flat YouTube entries hand back just the video id
-                url = f"https://www.youtube.com/watch?v={url}"
-            results.append(
-                {
-                    "title": entry.get("title") or query,
-                    "webpage_url": url,
-                    "duration": int(entry.get("duration") or 0) or None,
-                }
-            )
-    except (DownloadError, LookupError) as exc:
-        log.warning("youtube search failed: %s", reason_line(exc))
+        matches = search_soundcloud(query, limit)
+        results = [m for m in matches if _related_to(m, query)]
+        log.info("soundcloud search: %d result(s)", len(results))
+    except Exception as exc:
+        log.warning("soundcloud search failed: %s", reason_line(exc))
+        results = []
 
     if not results:
-        # YouTube turns away data-centre IPs often enough that the picker
-        # needs a second opinion - JioSaavn never asks who we are.
         try:
             results = search_jiosaavn(query, limit)
             log.info("jiosaavn search: %d result(s)", len(results))
         except Exception as exc:
             log.warning("jiosaavn search failed: %s", reason_line(exc))
             results = []
+
+    if not results:
+        options = dict(YDL_OPTIONS)
+        options["extract_flat"] = "in_playlist"
+        # /play sets this to keep playlist links short, but on a ytsearch it
+        # would cap the whole result list at one - which defeats a picker.
+        options.pop("playlist_items", None)
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+                entries = [e for e in (info or {}).get("entries", []) if e]
+
+            for entry in entries:
+                url = entry.get("webpage_url") or entry.get("url")
+                if not url:
+                    continue
+                if not is_url(url):
+                    # flat YouTube entries hand back just the video id
+                    url = f"https://www.youtube.com/watch?v={url}"
+                results.append(
+                    {
+                        "title": entry.get("title") or query,
+                        "webpage_url": url,
+                        "duration": int(entry.get("duration") or 0) or None,
+                    }
+                )
+            if results:
+                log.info("youtube search: %d result(s)", len(results))
+        except (DownloadError, LookupError) as exc:
+            log.warning("youtube search failed: %s", reason_line(exc))
 
     if not results:
         raise LookupError("no results")

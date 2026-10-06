@@ -11,8 +11,9 @@ no cloud anything.
 
 - Join and leave voice channels
 - Play local audio files from the `music/` folder
-- Songs from the internet: **JioSaavn** for plain queries (about 2s, no
-  account, no bot check) and **YouTube** through yt-dlp for links
+- Songs from the internet: **SoundCloud** first (about 3s, no account, no
+  bot check), then **JioSaavn** (about 1s), then **YouTube** through yt-dlp
+  - which is what a pasted YouTube or SoundCloud link uses
 - Pause, resume, skip and stop
 - Per-server queue with automatic advance to the next song
 - `/queue` and `/nowplaying` displays
