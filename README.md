@@ -133,6 +133,7 @@ seconds.
 | `/stop` | Stop and clear the queue |
 | `/queue` | Show what's playing and what's next |
 | `/nowplaying` | Show the current song |
+| `/history` | Recently played songs (needs a database) |
 
 Song lookup is forgiving: `believer`, `Believer.mp3` and `BE_LIEVER` all match
 `music/believer.mp3`.
@@ -154,6 +155,26 @@ music/
 - The queue lives in memory. Restart CASE and it's gone.
 - When the queue empties, CASE leaves the voice channel on its own.
 - `music/` is read once per `/play`, so new files work without a restart.
+- `/history` only works when `DATABASE_URL` is set. Locally the bot runs fine
+  without one and just says history is off.
+
+## Deploying to Render
+
+`render.yaml` describes the whole setup: one **Web Service** (Render's free
+plan has no background workers) plus a free **PostgreSQL** database.
+
+1. Push this repo to GitHub.
+2. On Render choose **New + → Blueprint** and point it at the repo.
+3. Add an environment variable `DISCORD_TOKEN` with your bot token
+   (it is left blank on purpose, `sync: false`).
+4. Deploy. Render creates `case-db` and passes its connection string to the
+   bot as `DATABASE_URL` automatically.
+
+CASE listens on `$PORT` so Render's health check passes, and the Discord
+connection itself is outbound, so no extra networking is needed.
+
+Free-tier caveats: the web service spins down after ~15 min of no HTTP
+traffic, and the free Postgres database expires after 30 days.
 
 ## Roadmap
 
