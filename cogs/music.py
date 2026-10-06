@@ -345,6 +345,7 @@ class Track:
         artist: str | None = None,
         thumbnail: str | None = None,
         temp_path: str | None = None,
+        start_offset: int = 0,
     ):
         self.source = source
         self.title = title
@@ -365,6 +366,7 @@ class Track:
 
 
         self.temp_path = temp_path
+        self.start_offset = start_offset
 
     def cleanup(self) -> None:
         """Delete the temporary file backing this track, if there is one."""
@@ -726,6 +728,7 @@ def _cut_track(track: Track, seconds: int) -> Track | None:
         artist=track.artist,
         thumbnail=track.thumbnail,
         temp_path=target,
+        start_offset=(track.start_offset or 0) + seconds,
     )
 
 
@@ -983,10 +986,13 @@ class MusicPlayer:
         random.shuffle(self.queue)
 
     def elapsed(self) -> int:
-        """Seconds played of the current track, or 0 if unknown."""
-        if self.started_at is None:
+        """Seconds played of the current track, from its seek position."""
+        if self.current is None:
             return 0
-        return max(0, int(time.monotonic() - self.started_at))
+        base = self.current.start_offset or 0
+        if self.started_at is None:
+            return base
+        return base + max(0, int(time.monotonic() - self.started_at))
 
     async def seek(self, seconds: int) -> bool:
         """Restart the current track at `seconds`."""
@@ -1065,12 +1071,12 @@ class MusicPlayer:
         log.info("playing %s", track.title)
 
         before_options = ""
-        if track.is_stream:
+        if track.is_stream and not track.temp_path:
 
 
 
             before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-            if not track.temp_path and track.headers:
+            if track.headers:
 
 
                 pairs = [f"{key}: {value}" for key, value in track.headers.items()]
@@ -1191,56 +1197,61 @@ class MusicPlayer:
         log.info("autoplay: looking for something like %r", finished.title)
 
         track = None
-
-
-
-
+        candidates: list[dict] = []
+        seen: set[str] = set()
         for query in queries:
-            try:
-                candidates = await asyncio.wait_for(
-                    asyncio.to_thread(search_jiosaavn, query, limit=5),
-                    timeout=20,
-                )
-            except Exception as exc:
-                log.warning(
-                    "autoplay jiosaavn search failed for %r: %s: %s",
-                    query,
-                    type(exc).__name__,
-                    exc,
-                )
-                continue
-            candidates = [c for c in candidates if _related_to(c, query)]
-            if not candidates:
-                continue
-            log.info("autoplay: jiosaavn %r -> %d candidate(s)", query, len(candidates))
+            for source, limit, timeout in (
+                (search_jiosaavn, 12, 20),
+                (search_soundcloud, 8, 30),
+            ):
+                try:
+                    found = await asyncio.wait_for(
+                        asyncio.to_thread(source, query, limit),
+                        timeout=timeout,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "autoplay %s search failed for %r: %s",
+                        source.__name__,
+                        query,
+                        type(exc).__name__,
+                    )
+                    continue
+                for cand in found:
+                    url = cand.get("webpage_url")
+                    if not url or url in seen:
+                        continue
+                    seen.add(url)
+                    if _related_to(cand, query):
+                        candidates.append(cand)
+            if candidates:
+                break
+            log.info("autoplay: %r gave no similar candidates yet", query)
+
+        if candidates:
+            log.info("autoplay: %d candidate(s) pooled", len(candidates))
             track = await self._first_playable(candidates, finished)
-            if track:
-                break
 
-
-
-        for query in queries:
-            if track:
-                break
-            try:
-                candidates = await asyncio.wait_for(
-                    asyncio.to_thread(search_candidates, query, limit=8),
-                    timeout=60,
-                )
-            except Exception as exc:
-                log.warning(
-                    "autoplay search failed for %r: %s: %s",
-                    query,
-                    type(exc).__name__,
-                    exc,
-                )
-                continue
-            if not candidates:
-                continue
-            log.info("autoplay: %r -> %d candidate(s)", query, len(candidates))
-            track = await self._first_playable(candidates, finished)
-            if track:
-                break
+        if track is None and queries:
+            for query in queries:
+                try:
+                    candidates = await asyncio.wait_for(
+                        asyncio.to_thread(search_candidates, query, limit=10),
+                        timeout=60,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "autoplay search failed for %r: %s",
+                        query,
+                        type(exc).__name__,
+                    )
+                    continue
+                if not candidates:
+                    continue
+                log.info("autoplay: %r -> %d fallback candidate(s)", query, len(candidates))
+                track = await self._first_playable(candidates, finished)
+                if track:
+                    break
 
         if track is None:
             log.info("autoplay found nothing new to play")
