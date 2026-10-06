@@ -1,0 +1,25 @@
+# virtual environment
+venv/
+.venv/
+
+# secrets - never commit this file
+.env
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# editors
+.idea/
+.vscode/
+
+# audio files
+music/*.mp3
+music/*.wav
+music/*.ogg
+music/*.m4a
+music/*.flac
+
+# throwaway debug scripts
+_sc*.py

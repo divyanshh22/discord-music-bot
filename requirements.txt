@@ -1,0 +1,11 @@
+discord.py>=2.3,<3.0
+python-dotenv>=1.0,<2.0
+
+# discord.py needs these two for voice. Without them it logs
+# "voice will NOT be supported" and /join silently fails.
+# They are optional extras, so pip won't install them from discord.py alone.
+PyNaCl>=1.5.0
+davey>=0.1.0; python_version >= "3.9"
+
+# resolves search terms and direct links into playable audio streams
+yt-dlp>=2024.1.0
