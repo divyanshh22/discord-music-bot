@@ -804,6 +804,10 @@ class MusicPlayer:
 
         except asyncio.CancelledError:
             pass
+        except Exception:
+            # Anything unexpected must not take the whole playback loop down
+            # silently - the queue would sit there with nothing happening.
+            log.exception("playback loop stopped on an unexpected error")
         finally:
             self.current = None
             # Stay in the channel when the queue runs dry - only /stop (or
@@ -910,15 +914,35 @@ class MusicPlayer:
         self._recent.append(finished.title)
         self._recent = self._recent[-15:]
 
-        # Going by the artist when we know it keeps the next pick in the same
-        # style; a bare title search still works when we don't.
-        query = finished.artist or finished.title
-        try:
-            candidates = await asyncio.to_thread(
-                search_candidates, query, limit=5
-            )
-        except (DownloadError, LookupError, ValueError) as exc:
-            log.warning("autoplay search failed: %s", exc)
+        # Try the artist first (keeps the next pick in the same style), then
+        # fall back to the title - a search for one of them often comes back
+        # empty while the other still works.
+        queries = [q for q in (finished.artist, finished.title) if q]
+        candidates: list[dict] = []
+        for query in queries:
+            try:
+                candidates = await asyncio.wait_for(
+                    asyncio.to_thread(search_candidates, query, limit=8),
+                    timeout=60,
+                )
+            except (DownloadError, LookupError, ValueError, asyncio.TimeoutError) as exc:
+                log.warning("autoplay search failed for %r: %s", query, exc)
+                continue
+            except Exception as exc:
+                log.warning(
+                    "autoplay search broke for %r: %s: %s",
+                    query,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            if candidates:
+                log.info("autoplay searching %r -> %d candidate(s)", query, len(candidates))
+                break
+
+        if not candidates:
+            log.info("autoplay found no candidates")
+            self._notify("Autoplay couldn't find anything similar to play.")
             return
 
         for candidate in candidates:
@@ -933,12 +957,21 @@ class MusicPlayer:
             except (DownloadError, LookupError, ValueError) as exc:
                 log.warning("autoplay could not resolve %s: %s", candidate["title"], exc)
                 continue
+            except Exception as exc:
+                log.warning(
+                    "autoplay resolve broke for %s: %s: %s",
+                    candidate["title"],
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
             log.info("autoplay picked %s", track.title)
             self.queue.append(track)
             self._notify(f"Autoplay: **{track.title}**")
             return
 
         log.info("autoplay found nothing new to play")
+        self._notify("Autoplay found nothing new - the queue stays empty.")
 
     def _notify(self, message: str) -> None:
         """Best-effort notice in the channel that started playback."""
