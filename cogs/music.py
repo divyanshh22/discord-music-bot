@@ -266,6 +266,7 @@ class Track:
         duration: int | None = None,
         webpage_url: str | None = None,
         headers: dict[str, str] | None = None,
+        artist: str | None = None,
     ):
         self.source = source
         self.title = title
@@ -275,6 +276,9 @@ class Track:
         # HTTP headers yt-dlp says go with this stream. FFmpeg needs them too,
         # otherwise the CDN answers 403 because the request looks automated.
         self.headers = headers or {}
+        # Who made it, when the source says so. Autoplay leans on this to
+        # find something in the same lane as the song that just ended.
+        self.artist = artist
         # Seconds to skip to when this track starts - set by /seek, consumed
         # by _play_one so the restart plays from that point.
         self.seek_offset = 0
@@ -528,6 +532,12 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
             raise LookupError("no playable stream for that track")
         url = formats[-1]["url"]
 
+    artist = info.get("artist") or info.get("creator") or info.get("uploader")
+    if isinstance(artist, str):
+        artist = artist.strip() or None
+    else:
+        artist = None
+
     return Track(
         source=url,
         title=info.get("title") or fallback_title,
@@ -535,6 +545,7 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
         duration=int(info.get("duration") or 0) or None,
         webpage_url=info.get("webpage_url"),
         headers=info.get("http_headers") or {},
+        artist=artist,
     )
 
 
@@ -783,8 +794,11 @@ class MusicPlayer:
 
                 if ok:
                     self._apply_loop(track)
-                    if not self.queue and self.autoplay:
-                        await self._queue_autoplay(track)
+
+                # Autoplay runs after a skip too, so /skip on the last song
+                # keeps the music going instead of winding down.
+                if not self.queue and self.autoplay:
+                    await self._queue_autoplay(track)
 
                 self.current = None
 
@@ -792,10 +806,10 @@ class MusicPlayer:
             pass
         finally:
             self.current = None
-            # Leave once the queue runs dry. on_voice_state_update removes the
-            # player from the cog's dict when the disconnect registers.
+            # Stay in the channel when the queue runs dry - only /stop (or
+            # someone kicking us out) ends the session.
             if self.voice.is_connected() and not self.queue:
-                await self.voice.disconnect()
+                log.info("queue finished - staying in the voice channel")
 
     async def _play_one(self, track: Track) -> bool:
         """Start one track and wait for it to finish.
@@ -896,9 +910,12 @@ class MusicPlayer:
         self._recent.append(finished.title)
         self._recent = self._recent[-15:]
 
+        # Going by the artist when we know it keeps the next pick in the same
+        # style; a bare title search still works when we don't.
+        query = finished.artist or finished.title
         try:
             candidates = await asyncio.to_thread(
-                search_candidates, finished.title, limit=5
+                search_candidates, query, limit=5
             )
         except (DownloadError, LookupError, ValueError) as exc:
             log.warning("autoplay search failed: %s", exc)
@@ -1000,6 +1017,9 @@ class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.players: dict[int, MusicPlayer] = {}
+        # Autoplay choice lives on the cog too, so it survives a player being
+        # thrown away (queue ended, bot restarted) instead of resetting.
+        self.default_autoplay = False
 
     def get_player(self, guild: discord.Guild) -> MusicPlayer | None:
         return self.players.get(guild.id)
@@ -1049,6 +1069,7 @@ class Music(commands.Cog):
         if player is None:
             player = MusicPlayer(voice)
             player.notify_channel = interaction.channel
+            player.autoplay = self.default_autoplay
             self.players[interaction.guild.id] = player
         else:
             # reconnecting after a drop - point the player at the live client
@@ -1204,14 +1225,22 @@ class Music(commands.Cog):
             await interaction.response.send_message("Nothing is playing right now.")
             return
 
+        # Skip only moves on - staying in the channel is handled by the
+        # playback loop, and leaving is /stop's job alone.
         if player.queue:
             nxt = player.queue[0].title
             player.skip()
             await interaction.response.send_message(f"Skipped. Now playing **{nxt}**.")
         else:
-            del self.players[interaction.guild.id]
-            await player.shutdown()
-            await interaction.response.send_message("Nothing left in the queue. Stopping.")
+            player.skip()
+            if player.autoplay:
+                await interaction.response.send_message(
+                    "Skipped. Autoplay is picking something similar..."
+                )
+            else:
+                await interaction.response.send_message(
+                    "Skipped. Nothing else queued - I'll stay in the channel."
+                )
 
     @discord.app_commands.command(name="stop", description="Stop playback and clear the queue.")
     async def stop(self, interaction: discord.Interaction):
@@ -1455,12 +1484,18 @@ class Music(commands.Cog):
     async def autoplay(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild)
         if player is None:
-            await interaction.response.send_message(
-                "Play something first - autoplay needs a song to go on from."
-            )
+            # No session running yet - remember the choice for the next one.
+            self.default_autoplay = not self.default_autoplay
+            if self.default_autoplay:
+                await interaction.response.send_message(
+                    "Autoplay **on**. The next session will keep picking similar songs."
+                )
+            else:
+                await interaction.response.send_message("Autoplay **off**.")
             return
 
         player.autoplay = not player.autoplay
+        self.default_autoplay = player.autoplay
         if player.autoplay:
             await interaction.response.send_message(
                 "Autoplay **on**. When the queue runs out I'll pick similar songs."
