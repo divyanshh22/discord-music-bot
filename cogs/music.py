@@ -174,6 +174,34 @@ def _words(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 2}
 
 
+def _autoplay_key(title: str) -> str:
+    """A title reduced to its core, so editions count as one song.
+
+    'Hale Dil (From "Murder 2")', 'Hale Dil (Acoustic)' and plain 'Hale
+    Dil' all collapse to 'dil hale': autoplay must not hand back a different
+    artist or edition of the very song that just ended.
+    """
+    text = title or ""
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"\[[^\]]*\]", " ", text)
+    text = re.sub(r"[|/·–—]", " ", text)
+    words = _words(text) - {
+        "official",
+        "hd",
+        "audio",
+        "song",
+        "video",
+        "from",
+        "remastered",
+        "remaster",
+        "lyric",
+        "lyrics",
+        "music",
+        "full",
+    }
+    return " ".join(sorted(words))
+
+
 def _related_to(candidate: dict, query: str) -> bool:
     """True when a search result really is about what we searched for.
 
@@ -1142,12 +1170,17 @@ class MusicPlayer:
             self._skip_once = False
 
     async def _first_playable(self, candidates: list[dict], finished: Track) -> Track | None:
-        """First candidate that actually resolves and isn't a repeat."""
+        """First candidate that resolves and isn't a song we already played.
+
+        Compared on autoplay keys, so any edition of "Hale Dil" - acoustic,
+        remix, another artist's upload - counts as "Hale Dil" itself.
+        """
+        played = set(self._recent)
+        finished_key = _autoplay_key(finished.title)
         for candidate in candidates:
             title = candidate.get("title") or ""
-            if normalize(title) == normalize(finished.title):
-                continue
-            if any(normalize(title) == normalize(t) for t in self._recent):
+            key = _autoplay_key(title)
+            if not key or key == finished_key or key in played:
                 continue
             try:
                 track = await asyncio.to_thread(
@@ -1181,7 +1214,7 @@ class MusicPlayer:
             log.info("autoplay off - nobody is listening")
             return
 
-        self._recent.append(finished.title)
+        self._recent.append(_autoplay_key(finished.title))
         self._recent = self._recent[-15:]
 
         # Artist first (keeps the next pick in the same style), then the
