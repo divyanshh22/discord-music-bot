@@ -124,6 +124,27 @@ def short_duration(seconds: int | None) -> str:
     return f"{minutes}:{rest:02d}"
 
 
+def reason_line(exc: Exception) -> str:
+    """One short line for a yt-dlp failure, so the reply can show why.
+
+    yt-dlp errors are often multi-line stacks with a URL on the first line
+    and the actual problem ("Sign in to confirm you're not a bot") on the
+    last, so the last non-empty line is the useful one.
+    """
+    lines = [line.strip() for line in str(exc).strip().splitlines() if line.strip()]
+    text = type(exc).__name__
+    for line in lines:
+        if line.startswith("ERROR"):
+            text = line
+            break
+    else:
+        if lines:
+            text = lines[-1]
+    if text.startswith("ERROR:"):
+        text = text[6:].strip()
+    return text[:200].replace("`", "'")
+
+
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
 
 
@@ -298,8 +319,13 @@ YDL_OPTIONS = {
 _NODE = find_node()
 if _NODE:
     YDL_OPTIONS["js_runtimes"] = {"node": {"path": _NODE}}
+    log.info("node.js: %s", _NODE)
 else:
     log.warning("node.js not found - some YouTube streams may fail with 403")
+
+# Both are external programs, so check them once at startup instead of
+# discovering a missing one when someone runs /play.
+log.info("ffmpeg: %s", find_ffmpeg() or "MISSING")
 
 MAX_RESULTS = 5
 
@@ -878,7 +904,7 @@ class Music(commands.Cog):
             # yt-dlp failures are expected, not crashes - one line, no traceback
             log.warning("could not resolve %r: %s", song, exc)
             await interaction.followup.send(
-                f"I couldn't find anything for **{song}**."
+                f"I couldn't find anything for **{song}**.\nReason: `{reason_line(exc)}`"
             )
             return
 
@@ -1150,8 +1176,10 @@ class Music(commands.Cog):
         except ValueError as exc:
             await interaction.followup.send(str(exc))
             return
-        except (DownloadError, LookupError):
-            await interaction.followup.send(f"I couldn't find anything for **{query}**.")
+        except (DownloadError, LookupError) as exc:
+            await interaction.followup.send(
+                f"I couldn't find anything for **{query}**.\nReason: `{reason_line(exc)}`"
+            )
             return
 
         picker = SearchPicker(self, results)
