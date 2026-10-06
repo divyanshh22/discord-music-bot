@@ -310,6 +310,12 @@ YDL_OPTIONS = {
     "no_warnings": True,
     "nocheckcertificate": True,
     "default_search": "ytsearch1",
+    # yt-dlp retries a failing request 10 times by default, which can eat the
+    # whole command timeout on a network YouTube distrusts. Give up quickly so
+    # the next player client gets a turn.
+    "retries": 1,
+    "fragment_retries": 1,
+    "socket_timeout": 15,
     "logger": _YDLLogger(),
 }
 
@@ -396,6 +402,7 @@ def resolve_track(query: str, requested_by: str) -> Track:
     for attempt, extra in enumerate(YOUTUBE_CLIENT_ATTEMPTS):
         if attempt:
             log.info("retrying with client set %s", extra["extractor_args"])
+        started = time.monotonic()
         try:
             info = _extract_once({**YDL_OPTIONS, **extra}, query)
             break
@@ -403,7 +410,12 @@ def resolve_track(query: str, requested_by: str) -> Track:
             # Only a rejected client is worth retrying - our own LookupError
             # ("no results") would fail identically with every client.
             last_error = exc
-            log.warning("client attempt %d failed: %s", attempt, reason_line(exc))
+            log.warning(
+                "client attempt %d failed after %.1fs: %s",
+                attempt,
+                time.monotonic() - started,
+                reason_line(exc),
+            )
 
     if info is None:
         if last_error is None:
@@ -788,7 +800,7 @@ class SearchPicker(discord.ui.View):
                     chosen["webpage_url"],
                     interaction.user.display_name,
                 ),
-                timeout=45,
+                timeout=100,
             )
         except asyncio.TimeoutError:
             await interaction.followup.send("That took too long to load. Try again.")
@@ -916,13 +928,15 @@ class Music(commands.Cog):
         # Resolving a stream can take a few seconds, so acknowledge immediately.
         await interaction.response.defer(ephemeral=True)
         log.info("play: resolving %r", song)
+        started = time.monotonic()
 
         try:
             # yt-dlp is blocking, so keep it off the event loop. The timeout
             # stops a slow site from leaving the command at "thinking" forever.
+            # It has to cover every player-client fallback attempt.
             track = await asyncio.wait_for(
                 asyncio.to_thread(resolve_track, song, interaction.user.display_name),
-                timeout=45,
+                timeout=100,
             )
         except asyncio.TimeoutError:
             log.warning("resolve timed out for %r", song)
@@ -943,7 +957,9 @@ class Music(commands.Cog):
             )
             return
 
-        log.info("play: resolved %r -> %s", song, track.title)
+        log.info(
+            "play: resolved %r -> %s (%.1fs)", song, track.title, time.monotonic() - started
+        )
         await self._queue_track(interaction, track, song)
 
     async def _queue_track(
