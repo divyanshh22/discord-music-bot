@@ -169,6 +169,27 @@ def _lyrics_key(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
 
 
+def _words(text: str) -> set[str]:
+    """Meaningful words in a title or artist name, for loose matching."""
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 2}
+
+
+def _related_to(candidate: dict, query: str) -> bool:
+    """True when a search result really is about what we searched for.
+
+    JioSaavn answers almost any query with something, so autoplay needs to
+    tell a song by this artist apart from one that merely ranks well. The
+    rule is one set of words inside the other: either the result narrows the
+    query (title "Sajni" for a long query) or it repeats it (both "jal" and
+    "band" present), which rules out the loose matches in between.
+    """
+    wanted = _words(query)
+    found = _words(candidate.get("title")) | _words(candidate.get("artist"))
+    if not wanted or not found:
+        return False
+    return found <= wanted or wanted <= found
+
+
 def lyrics_score(item: dict, title: str, artist: str | None, duration: int | None) -> int:
     """Confidence that `item` is the same song. 0 means "not this song".
 
@@ -566,11 +587,14 @@ def search_jiosaavn(query: str, limit: int = MAX_RESULTS) -> list[dict]:
         page = item.get("perma_url")
         if not page:
             continue
+        artist = (item.get("primary_artists") or item.get("music") or "").strip()
         results.append(
             {
                 "title": item.get("song") or query,
                 "webpage_url": page,
                 "duration": int(item.get("duration") or 0) or None,
+                "artist": artist or None,
+                "thumbnail": item.get("image") or None,
             }
         )
     return results
@@ -757,6 +781,8 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
         value=f"{source} · {track.duration_label()}",
         inline=True,
     )
+    if track.artist:
+        embed.add_field(name="Artist", value=track.artist[:100], inline=True)
     embed.add_field(name="Requested by", value=track.requested_by, inline=True)
 
     if track.duration:
@@ -1076,7 +1102,37 @@ class MusicPlayer:
         log.info("autoplay: looking for something like %r", finished.title)
 
         track = None
+
+        # JioSaavn first: it answers in about a second while YouTube can sit
+        # there for a minute when it doesn't like our IP. Its search is loose
+        # though, so results have to actually relate to what we asked for.
         for query in queries:
+            try:
+                candidates = await asyncio.wait_for(
+                    asyncio.to_thread(search_jiosaavn, query, limit=5),
+                    timeout=20,
+                )
+            except Exception as exc:
+                log.warning(
+                    "autoplay jiosaavn search failed for %r: %s: %s",
+                    query,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            candidates = [c for c in candidates if _related_to(c, query)]
+            if not candidates:
+                continue
+            log.info("autoplay: jiosaavn %r -> %d candidate(s)", query, len(candidates))
+            track = await self._first_playable(candidates, finished)
+            if track:
+                break
+
+        # Slower fallback - YouTube search (with JioSaavn inside it) covers
+        # songs the Indian catalog doesn't have.
+        for query in queries:
+            if track:
+                break
             try:
                 candidates = await asyncio.wait_for(
                     asyncio.to_thread(search_candidates, query, limit=8),
@@ -1096,30 +1152,6 @@ class MusicPlayer:
             track = await self._first_playable(candidates, finished)
             if track:
                 break
-
-        # YouTube will sometimes answer a search but refuse to stream here.
-        # JioSaavn does neither of those things, so try it directly.
-        if track is None:
-            for query in queries:
-                try:
-                    candidates = await asyncio.wait_for(
-                        asyncio.to_thread(search_jiosaavn, query, limit=5),
-                        timeout=45,
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "autoplay jiosaavn search failed for %r: %s: %s",
-                        query,
-                        type(exc).__name__,
-                        exc,
-                    )
-                    continue
-                if not candidates:
-                    continue
-                log.info("autoplay: jiosaavn %r -> %d candidate(s)", query, len(candidates))
-                track = await self._first_playable(candidates, finished)
-                if track:
-                    break
 
         if track is None:
             log.info("autoplay found nothing new to play")
