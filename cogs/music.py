@@ -329,29 +329,21 @@ log.info("ffmpeg: %s", find_ffmpeg() or "MISSING")
 
 MAX_RESULTS = 5
 
+# YouTube treats data-centre IPs (Render, VPS, ...) as suspicious and answers
+# its default browser client with "Sign in to confirm you're not a bot". The
+# TV/mweb clients are checked far less strictly, so on a hosted network we
+# fall back through them before giving up. On a home connection the first
+# attempt wins and the rest never run.
+YOUTUBE_CLIENT_ATTEMPTS: list[dict] = [
+    {},
+    {"extractor_args": {"youtube": {"player_client": ["tv", "web_safari"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["mweb", "android_vr"]}}},
+]
 
-def resolve_track(query: str, requested_by: str) -> Track:
-    """Turn a /play argument into a Track.
 
-    Local files win over the internet so you can always play your own
-    versions by name. Otherwise the query goes to yt-dlp, which handles
-    direct URLs (YouTube, SoundCloud, ...) as well as plain search terms.
-
-    Blocking, so it must run in a thread.
-    """
-    query = query.strip()
-    if not query:
-        raise ValueError("empty query")
-
-    reason = unsupported_reason(query)
-    if reason:
-        raise ValueError(reason)
-
-    path = find_song(query)
-    if path is not None:
-        return Track.from_file(path, requested_by)
-
-    with YoutubeDL(YDL_OPTIONS) as ydl:
+def _extract_once(options: dict, query: str) -> dict | None:
+    """One yt-dlp extraction - search first, then the full video details."""
+    with YoutubeDL(options) as ydl:
         if is_url(query):
             info = ydl.extract_info(query, download=False)
             if not info:
@@ -374,6 +366,49 @@ def resolve_track(query: str, requested_by: str) -> Track:
             # flat entries only carry an id/title - force the real stream details
             if not info.get("url") and not info.get("formats"):
                 info = ydl.process_ie_result(info, download=False)
+
+    return info
+
+
+def resolve_track(query: str, requested_by: str) -> Track:
+    """Turn a /play argument into a Track.
+
+    Local files win over the internet so you can always play your own
+    versions by name. Otherwise the query goes to yt-dlp, which handles
+    direct URLs (YouTube, SoundCloud, ...) as well as plain search terms.
+
+    Blocking, so it must run in a thread.
+    """
+    query = query.strip()
+    if not query:
+        raise ValueError("empty query")
+
+    reason = unsupported_reason(query)
+    if reason:
+        raise ValueError(reason)
+
+    path = find_song(query)
+    if path is not None:
+        return Track.from_file(path, requested_by)
+
+    info: dict | None = None
+    last_error: Exception | None = None
+    for attempt, extra in enumerate(YOUTUBE_CLIENT_ATTEMPTS):
+        if attempt:
+            log.info("retrying with client set %s", extra["extractor_args"])
+        try:
+            info = _extract_once({**YDL_OPTIONS, **extra}, query)
+            break
+        except DownloadError as exc:
+            # Only a rejected client is worth retrying - our own LookupError
+            # ("no results") would fail identically with every client.
+            last_error = exc
+            log.warning("client attempt %d failed: %s", attempt, reason_line(exc))
+
+    if info is None:
+        if last_error is None:
+            raise LookupError("no results")
+        raise last_error
 
     url = info.get("url")
     if not url:
