@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import random
@@ -11,8 +12,9 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import discord
 import aiohttp
@@ -454,12 +456,95 @@ def _extract_once(options: dict, query: str) -> dict | None:
     return info
 
 
+JIOSAAVN_API = "https://www.jiosaavn.com/api.php"
+
+
+def search_jiosaavn(query: str, limit: int = MAX_RESULTS) -> list[dict]:
+    """Top songs for a query from JioSaavn - no account, no bot check.
+
+    Returns the same shape as search_candidates so /search can fall back to
+    it when YouTube refuses our IP. Runs in a thread: it blocks on urllib.
+    """
+    params = urlencode(
+        {
+            "_format": "json",
+            "_method": "get",
+            "_page": "1",
+            "p": "1",
+            "n": str(limit),
+            "q": query,
+            "result": "song",
+            "specific": "true",
+            "__call": "search.getResults",
+        }
+    )
+    request = urllib.request.Request(
+        f"{JIOSAAVN_API}?{params}",
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        data = json.load(response)
+
+    results = []
+    for item in (data.get("results") or [])[:limit]:
+        page = item.get("perma_url")
+        if not page:
+            continue
+        results.append(
+            {
+                "title": item.get("song") or query,
+                "webpage_url": page,
+                "duration": int(item.get("duration") or 0) or None,
+            }
+        )
+    return results
+
+
+def _jiosaavn_info(query: str) -> dict | None:
+    """First JioSaavn match for a plain query, fully resolved - or None.
+
+    Any failure just means "let YouTube have a go", so nothing propagates.
+    """
+    try:
+        matches = search_jiosaavn(query, limit=1)
+        if not matches:
+            log.info("jiosaavn: no match for %r", query)
+            return None
+        page = matches[0]["webpage_url"]
+        log.info("jiosaavn: %r -> %s", query, page)
+        return _extract_once(YDL_OPTIONS, page)
+    except Exception as exc:
+        log.warning("jiosaavn failed for %r: %s", query, reason_line(exc))
+        return None
+
+
+def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
+    """Turn an extraction result into a playable Track."""
+    url = info.get("url")
+    if not url:
+        # some sites only hand back formats, not a resolved stream url
+        formats = [f for f in info.get("formats", []) if f.get("url")]
+        if not formats:
+            raise LookupError("no playable stream for that track")
+        url = formats[-1]["url"]
+
+    return Track(
+        source=url,
+        title=info.get("title") or fallback_title,
+        requested_by=requested_by,
+        duration=int(info.get("duration") or 0) or None,
+        webpage_url=info.get("webpage_url"),
+        headers=info.get("http_headers") or {},
+    )
+
+
 def resolve_track(query: str, requested_by: str) -> Track:
     """Turn a /play argument into a Track.
 
     Local files win over the internet so you can always play your own
-    versions by name. Otherwise the query goes to yt-dlp, which handles
-    direct URLs (YouTube, SoundCloud, ...) as well as plain search terms.
+    versions by name. Plain queries go to JioSaavn first (fast, and it never
+    asks a data-centre IP to sign in), then to yt-dlp for YouTube links and
+    for anything JioSaavn missed.
 
     Blocking, so it must run in a thread.
     """
@@ -474,6 +559,14 @@ def resolve_track(query: str, requested_by: str) -> Track:
     path = find_song(query)
     if path is not None:
         return Track.from_file(path, requested_by)
+
+    if not is_url(query):
+        jsaavn_info = _jiosaavn_info(query)
+        if jsaavn_info:
+            try:
+                return _build_track(jsaavn_info, query, requested_by)
+            except LookupError:
+                log.warning("jiosaavn had no playable stream for %r", query)
 
     info: dict | None = None
     last_error: Exception | None = None
@@ -500,22 +593,7 @@ def resolve_track(query: str, requested_by: str) -> Track:
             raise LookupError("no results")
         raise last_error
 
-    url = info.get("url")
-    if not url:
-        # some sites only hand back formats, not a resolved stream url
-        formats = [f for f in info.get("formats", []) if f.get("url")]
-        if not formats:
-            raise LookupError("no playable stream for that track")
-        url = formats[-1]["url"]
-
-    return Track(
-        source=url,
-        title=info.get("title") or query,
-        requested_by=requested_by,
-        duration=int(info.get("duration") or 0) or None,
-        webpage_url=info.get("webpage_url"),
-        headers=info.get("http_headers") or {},
-    )
+    return _build_track(info, query, requested_by)
 
 
 def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
@@ -539,25 +617,38 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     # cap the whole result list at one - which defeats a picker.
     options.pop("playlist_items", None)
 
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-        entries = [e for e in (info or {}).get("entries", []) if e]
-
     results = []
-    for entry in entries:
-        url = entry.get("webpage_url") or entry.get("url")
-        if not url:
-            continue
-        if not is_url(url):
-            # flat YouTube entries hand back just the video id
-            url = f"https://www.youtube.com/watch?v={url}"
-        results.append(
-            {
-                "title": entry.get("title") or query,
-                "webpage_url": url,
-                "duration": int(entry.get("duration") or 0) or None,
-            }
-        )
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+            entries = [e for e in (info or {}).get("entries", []) if e]
+
+        for entry in entries:
+            url = entry.get("webpage_url") or entry.get("url")
+            if not url:
+                continue
+            if not is_url(url):
+                # flat YouTube entries hand back just the video id
+                url = f"https://www.youtube.com/watch?v={url}"
+            results.append(
+                {
+                    "title": entry.get("title") or query,
+                    "webpage_url": url,
+                    "duration": int(entry.get("duration") or 0) or None,
+                }
+            )
+    except (DownloadError, LookupError) as exc:
+        log.warning("youtube search failed: %s", reason_line(exc))
+
+    if not results:
+        # YouTube turns away data-centre IPs often enough that the picker
+        # needs a second opinion - JioSaavn never asks who we are.
+        try:
+            results = search_jiosaavn(query, limit)
+            log.info("jiosaavn search: %d result(s)", len(results))
+        except Exception as exc:
+            log.warning("jiosaavn search failed: %s", reason_line(exc))
+            results = []
 
     if not results:
         raise LookupError("no results")
