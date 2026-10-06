@@ -787,12 +787,17 @@ def _is_bot_check(exc: Exception) -> bool:
 
 
 _YOUTUBE_TEXT_TIMEOUT = 2.0
+_AUTO = object()
 
 
 async def _youtube_info(
-    query: str, timeout: float | None = _YOUTUBE_TEXT_TIMEOUT
+    query: str, timeout: object = _AUTO
 ) -> tuple[dict | None, Exception | None]:
-    """First usable YouTube result for a query across client fallbacks. `timeout=None` lets a pasted link take as long as it needs."""
+    """First usable YouTube result across client fallbacks. `timeout=2` hard-caps fast text replies; `timeout=None` lets a pasted link take as long as it needs; default AUTO is 2s without cookies, unlimited with cookies so a real YouTube search can win."""
+    if timeout is _AUTO:
+        cap: float | None = None if _COOKIES else _YOUTUBE_TEXT_TIMEOUT
+    else:
+        cap = timeout
     last_error: Exception | None = None
     for attempt, extra in enumerate(YOUTUBE_CLIENT_ATTEMPTS):
         if attempt:
@@ -800,11 +805,11 @@ async def _youtube_info(
         started = time.monotonic()
         try:
             future = asyncio.to_thread(_extract_once, _merge_options(extra), query)
-            info = await asyncio.wait_for(future, timeout) if timeout else await future
+            info = await asyncio.wait_for(future, cap) if cap else await future
             return info, None
         except asyncio.TimeoutError:
-            last_error = DownloadError(f"youtube timed out after {timeout}s")
-            log.warning("youtube client attempt %d timed out after %.1fs", attempt, timeout)
+            last_error = DownloadError(f"youtube timed out after {cap}s")
+            log.warning("youtube client attempt %d timed out after %.1fs", attempt, cap)
             break
         except DownloadError as exc:
             last_error = exc
