@@ -786,15 +786,26 @@ def _is_bot_check(exc: Exception) -> bool:
     return "sign in to confirm" in message or "not a bot" in message
 
 
-def _youtube_info(query: str) -> tuple[dict | None, Exception | None]:
-    """First usable YouTube/none result for a query across client fallbacks."""
+_YOUTUBE_TEXT_TIMEOUT = 2.0
+
+
+async def _youtube_info(
+    query: str, timeout: float | None = _YOUTUBE_TEXT_TIMEOUT
+) -> tuple[dict | None, Exception | None]:
+    """First usable YouTube result for a query across client fallbacks. `timeout=None` lets a pasted link take as long as it needs."""
     last_error: Exception | None = None
     for attempt, extra in enumerate(YOUTUBE_CLIENT_ATTEMPTS):
         if attempt:
             log.info("youtube retry %d with client set %s", attempt, extra["extractor_args"])
         started = time.monotonic()
         try:
-            return _extract_once(_merge_options(extra), query), None
+            future = asyncio.to_thread(_extract_once, _merge_options(extra), query)
+            info = await asyncio.wait_for(future, timeout) if timeout else await future
+            return info, None
+        except asyncio.TimeoutError:
+            last_error = DownloadError(f"youtube timed out after {timeout}s")
+            log.warning("youtube client attempt %d timed out after %.1fs", attempt, timeout)
+            break
         except DownloadError as exc:
             last_error = exc
             log.warning(
@@ -809,7 +820,7 @@ def _youtube_info(query: str) -> tuple[dict | None, Exception | None]:
     return None, last_error
 
 
-def resolve_track(query: str, requested_by: str) -> Track:
+async def resolve_track(query: str, requested_by: str) -> Track:
     """Turn a /play argument into a Track."""
     query = query.strip()
     if not query:
@@ -824,28 +835,28 @@ def resolve_track(query: str, requested_by: str) -> Track:
         return Track.from_file(path, requested_by)
 
     if is_url(query):
-        info, last_error = _youtube_info(query)
+        info, last_error = await _youtube_info(query, timeout=None)
         if info is None:
             if last_error is None:
                 raise LookupError("no results")
             raise last_error
         return _build_track(info, query, requested_by)
 
-    info, last_error = _youtube_info(query)
+    info, last_error = await _youtube_info(query)
     if info is not None:
         try:
             return _build_track(info, query, requested_by)
         except LookupError:
             log.warning("youtube had no playable stream for %r", query)
 
-    jsaavn_info = _jiosaavn_info(query)
+    jsaavn_info = await asyncio.to_thread(_jiosaavn_info, query)
     if jsaavn_info:
         try:
             return _build_track(jsaavn_info, query, requested_by)
         except LookupError:
             log.warning("jiosaavn had no playable stream for %r", query)
 
-    sc_info = _soundcloud_info(query)
+    sc_info = await asyncio.to_thread(_soundcloud_info, query)
     if sc_info:
         try:
             return _build_track(sc_info, query, requested_by)
@@ -1109,8 +1120,8 @@ class MusicPlayer:
 
                     log.info("retrying %s with a fresh stream URL", track.title)
                     try:
-                        fresh = await asyncio.to_thread(
-                            resolve_track, track.webpage_url or track.title, track.requested_by
+                        fresh = await resolve_track(
+                            track.webpage_url or track.title, track.requested_by
                         )
                     except (DownloadError, LookupError, ValueError) as exc:
                         log.warning("could not re-resolve %s: %s", track.title, exc)
@@ -1238,8 +1249,8 @@ class MusicPlayer:
             if not key or key == finished_key or key in played:
                 continue
             try:
-                track = await asyncio.to_thread(
-                    resolve_track, candidate["webpage_url"], finished.requested_by
+                track = await resolve_track(
+                    candidate["webpage_url"], finished.requested_by
                 )
             except (DownloadError, LookupError, ValueError) as exc:
                 log.warning("autoplay could not resolve %s: %s", title, exc)
@@ -1412,8 +1423,7 @@ class SearchPicker(discord.ui.View):
 
         try:
             track = await asyncio.wait_for(
-                asyncio.to_thread(
-                    resolve_track,
+                resolve_track(
                     chosen["webpage_url"],
                     interaction.user.display_name,
                 ),
@@ -1553,7 +1563,7 @@ class Music(commands.Cog):
 
 
             track = await asyncio.wait_for(
-                asyncio.to_thread(resolve_track, song, interaction.user.display_name),
+                resolve_track(song, interaction.user.display_name),
                 timeout=100,
             )
         except asyncio.TimeoutError:
