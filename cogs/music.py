@@ -854,6 +854,11 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         except LookupError:
             log.warning("youtube had no playable stream for %r", query)
 
+    if _COOKIES:
+        if last_error is not None:
+            raise last_error
+        raise LookupError("youtube had no playable result for this query")
+
     jsaavn_info = await asyncio.to_thread(_jiosaavn_info, query)
     if jsaavn_info:
         try:
@@ -1383,7 +1388,7 @@ class MusicPlayer:
                 self.current is track
                 and (self.voice.is_playing() or self.voice.is_paused())
             ):
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 message = self._now_message
                 if message is None:
                     break
