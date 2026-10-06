@@ -9,3 +9,6 @@ davey>=0.1.0; python_version >= "3.9"
 
 # resolves search terms and direct links into playable audio streams
 yt-dlp>=2024.1.0
+
+# PostgreSQL, only used when DATABASE_URL is set (Render, production)
+asyncpg>=0.29,<1.0

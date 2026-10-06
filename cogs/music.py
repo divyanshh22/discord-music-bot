@@ -16,6 +16,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
 import config
+import db
 
 log = logging.getLogger("case")
 
@@ -453,6 +454,16 @@ class MusicPlayer:
         error = errors[0] if errors else None
         if error is not None:
             log.warning("playback of %s ended early: %s", track.title, error)
+        else:
+            # It actually played, so it is worth remembering.
+            await db.log_play(
+                self.voice.guild.id,
+                track.title,
+                channel_id=self.voice.channel.id if self.voice.channel else None,
+                url=track.webpage_url,
+                requested_by=track.requested_by,
+                duration=track.duration,
+            )
 
         self.current = None
         return error is None
@@ -710,6 +721,33 @@ class Music(commands.Cog):
         await interaction.response.send_message(
             embed=self._now_playing_embed(player.current, player)
         )
+
+    @discord.app_commands.command(name="history", description="Show recently played songs.")
+    async def history(self, interaction: discord.Interaction):
+        if not db.available():
+            await interaction.response.send_message(
+                "Play history isn't enabled - CASE is running without a database."
+            )
+            return
+
+        await interaction.response.defer()
+        rows = await db.recent_plays(interaction.guild.id, limit=10)
+
+        if not rows:
+            await interaction.followup.send("No songs have been played yet.")
+            return
+
+        lines = []
+        for row in rows:
+            stamp = row["played_at"].astimezone().strftime("%d %b %H:%M")
+            lines.append(f"`{stamp}` **{row['title']}** — {row['requested_by']}")
+
+        embed = discord.Embed(
+            title="Recently Played",
+            description="\n".join(lines),
+            colour=discord.Colour.blurple(),
+        )
+        await interaction.followup.send(embed=embed)
 
     def _now_playing_embed(self, track: Track, player: MusicPlayer) -> discord.Embed:
         status = "Paused" if player.is_paused else "Playing"

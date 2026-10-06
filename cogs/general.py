@@ -38,7 +38,10 @@ class General(commands.Cog):
                 "`/pause` — pause playback\n"
                 "`/resume` — resume playback\n"
                 "`/skip` — jump to the next song\n"
-                "`/stop` — stop and clear the queue"
+                "`/stop` — stop and clear the queue\n"
+                "`/queue` — show what's up next\n"
+                "`/nowplaying` — show the current song\n"
+                "`/history` — recently played songs"
             ),
             inline=False,
         )
