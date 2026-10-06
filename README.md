@@ -127,12 +127,21 @@ seconds.
 | `/join` | Join your voice channel |
 | `/leave` | Leave the voice channel |
 | `/play <song>` | Play a file from `music/`, or queue it |
+| `/search <query>` | Pick from a list of results before playing |
 | `/pause` | Pause playback |
 | `/resume` | Resume playback |
 | `/skip` | Next song, or stop if nothing is queued |
 | `/stop` | Stop and clear the queue |
+| `/seek 1:30` | Jump to a spot in the current song |
+| `/loop off\|song\|queue` | Repeat the song or the whole queue |
+| `/shuffle` | Randomise the queue |
+| `/remove <n>` | Take one song out of the queue |
+| `/clear` | Empty the queue, keep the current song |
+| `/jump <n>` | Skip ahead to a queue position |
+| `/autoplay` | Keep picking similar songs when the queue runs dry |
 | `/queue` | Show what's playing and what's next |
-| `/nowplaying` | Show the current song |
+| `/nowplaying` | Current song, with a progress bar |
+| `/lyrics` | Lyrics for the current song, or any search |
 | `/history` | Recently played songs (needs a database) |
 
 Song lookup is forgiving: `believer`, `Believer.mp3` and `BE_LIEVER` all match

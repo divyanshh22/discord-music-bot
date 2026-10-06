@@ -32,15 +32,25 @@ class General(commands.Cog):
             inline=False,
         )
         embed.add_field(
-            name="Music",
+            name="Playback",
             value=(
                 "`/play <song>` — play by name, link, or local file\n"
-                "`/pause` — pause playback\n"
-                "`/resume` — resume playback\n"
-                "`/skip` — jump to the next song\n"
-                "`/stop` — stop and clear the queue\n"
+                "`/search <query>` — pick from a list before playing\n"
+                "`/pause` · `/resume` · `/skip` · `/stop`\n"
+                "`/seek 1:30` — jump inside the current song\n"
+                "`/lyrics` — lyrics for what's playing (or any search)"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Queue",
+            value=(
                 "`/queue` — show what's up next\n"
-                "`/nowplaying` — show the current song\n"
+                "`/shuffle` — randomise the queue\n"
+                "`/remove <n>` · `/clear` · `/jump <n>`\n"
+                "`/loop off|song|queue` — repeat\n"
+                "`/autoplay` — keep playing similar songs\n"
+                "`/nowplaying` — current song with progress\n"
                 "`/history` — recently played songs"
             ),
             inline=False,

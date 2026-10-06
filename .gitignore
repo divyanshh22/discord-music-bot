@@ -22,4 +22,6 @@ music/*.m4a
 music/*.flac
 
 # throwaway debug scripts
-_sc*.py
+_*.py
+# local logs
+*.log

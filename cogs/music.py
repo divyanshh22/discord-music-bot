@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 import shlex
 import shutil
@@ -11,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import discord
+import aiohttp
 from discord.ext import commands
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -88,6 +90,60 @@ def normalize(text: str) -> str:
 def is_url(text: str) -> bool:
     parsed = urlparse(text)
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def parse_timestamp(text: str) -> int:
+    """Turn "90", "1:30" or "1:02:03" into seconds."""
+    text = text.strip()
+    if text.isdigit():
+        return int(text)
+    parts = text.split(":")
+    if not 1 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        raise ValueError("Use seconds (90) or mm:ss (1:30).")
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return seconds
+
+
+def progress_bar(elapsed: int, total: int, width: int = 20) -> str:
+    """A compact slider like `------*-------------` for embeds."""
+    if not total:
+        return "♪" * width
+    filled = max(0, min(width, round(width * elapsed / total)))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def short_duration(seconds: int | None) -> str:
+    """`3:45` for dropdown descriptions, blank when unknown."""
+    if not seconds:
+        return ""
+    minutes, rest = divmod(seconds, 60)
+    if minutes >= 60:
+        return f"{minutes // 60}:{minutes % 60:02d}:{rest:02d}"
+    return f"{minutes}:{rest:02d}"
+
+
+LRCLIB_SEARCH = "https://lrclib.net/api/search"
+
+
+async def fetch_lyrics(query: str) -> dict | None:
+    """Best match for `query` from lrclib.net - free, no API key needed.
+
+    Returns the raw result (it has plainLyrics/artistName/...) or None.
+    """
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(LRCLIB_SEARCH, params={"q": query}) as resp:
+            if resp.status != 200:
+                log.warning("lrclib returned HTTP %s", resp.status)
+                return None
+            results = await resp.json()
+
+    for item in results:
+        if item.get("plainLyrics"):
+            return item
+    return None
 
 
 # Sites that never hand over playable audio - either they only expose
@@ -182,6 +238,9 @@ class Track:
         # HTTP headers yt-dlp says go with this stream. FFmpeg needs them too,
         # otherwise the CDN answers 403 because the request looks automated.
         self.headers = headers or {}
+        # Seconds to skip to when this track starts - set by /seek, consumed
+        # by _play_one so the restart plays from that point.
+        self.seek_offset = 0
 
     @classmethod
     def from_file(cls, path: Path, requested_by: str = "someone") -> Track:
@@ -308,6 +367,52 @@ def resolve_track(query: str, requested_by: str) -> Track:
     )
 
 
+def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
+    """Top results for a query, without resolving a stream URL yet.
+
+    Flat extraction is fast, which matters because /search shows a picker and
+    the user may take a while to choose - by then a resolved stream URL would
+    have gone stale. The picked result is resolved properly at play time.
+    """
+    query = query.strip()
+    if not query:
+        raise ValueError("empty query")
+
+    reason = unsupported_reason(query)
+    if reason:
+        raise ValueError(reason)
+
+    options = dict(YDL_OPTIONS)
+    options["extract_flat"] = "in_playlist"
+    # /play sets this to keep playlist links short, but on a ytsearch it would
+    # cap the whole result list at one - which defeats a picker.
+    options.pop("playlist_items", None)
+
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+        entries = [e for e in (info or {}).get("entries", []) if e]
+
+    results = []
+    for entry in entries:
+        url = entry.get("webpage_url") or entry.get("url")
+        if not url:
+            continue
+        if not is_url(url):
+            # flat YouTube entries hand back just the video id
+            url = f"https://www.youtube.com/watch?v={url}"
+        results.append(
+            {
+                "title": entry.get("title") or query,
+                "webpage_url": url,
+                "duration": int(entry.get("duration") or 0) or None,
+            }
+        )
+
+    if not results:
+        raise LookupError("no results")
+    return results
+
+
 class MusicPlayer:
     """Plays a queue of local files in one voice channel.
 
@@ -320,6 +425,20 @@ class MusicPlayer:
         self.current: Track | None = None
         self.notify_channel: discord.abc.Messageable | None = None
         self._task: asyncio.Task | None = None
+        # "off" repeats nothing, "song" replays the current track, "queue"
+        # pushes a finished track back onto the end of the queue.
+        self.loop_mode = "off"
+        self.autoplay = False
+        # Monotonic timestamp of when the current track actually started, so
+        # /nowplaying can draw a progress bar.
+        self.started_at: float | None = None
+        # Set by /seek, cleared by the playback loop so the same track is
+        # queued again instead of moving on.
+        self._seek_pending = False
+        # Makes /skip ignore song-loop for one round so skip still advances.
+        self._skip_once = False
+        # Last few titles, used by autoplay to avoid instantly repeating.
+        self._recent: list[str] = []
 
     @property
     def is_playing(self) -> bool:
@@ -360,12 +479,32 @@ class MusicPlayer:
 
     def skip(self) -> None:
         """Drop the current song. The playback loop picks up the next one."""
+        self._skip_once = True
         if self.voice.is_paused():
             self.voice.resume()
         self.voice.stop()
 
     def clear(self) -> None:
         self.queue.clear()
+
+    def shuffle(self) -> None:
+        random.shuffle(self.queue)
+
+    def elapsed(self) -> int:
+        """Seconds played of the current track, or 0 if unknown."""
+        if self.started_at is None:
+            return 0
+        return max(0, int(time.monotonic() - self.started_at))
+
+    def seek(self, seconds: int) -> bool:
+        """Restart the current track at `seconds`. Needs a track to seek in."""
+        if self.current is None or not self.voice.is_connected():
+            return False
+        self.current.seek_offset = max(0, seconds)
+        self._seek_pending = True
+        # Stopping makes _play_one return, and the loop re-queues this track.
+        self.voice.stop()
+        return True
 
     async def _run(self) -> None:
         """Play each queued track until the queue runs out or we get stopped."""
@@ -377,6 +516,14 @@ class MusicPlayer:
 
                 track = self.queue.pop(0)
                 ok = await self._play_one(track)
+
+                # /seek stopped this track on purpose - play it again from
+                # the new position instead of moving on.
+                if self._seek_pending:
+                    self._seek_pending = False
+                    self.queue.insert(0, track)
+                    continue
+
                 if not ok and track.is_stream and self.voice.is_connected():
                     # The stream URL had likely gone stale (YouTube answers 403
                     # once a link ages or gets reused). Resolve it again and
@@ -390,7 +537,12 @@ class MusicPlayer:
                         log.warning("could not re-resolve %s: %s", track.title, exc)
                         continue
                     track = fresh
-                    await self._play_one(track)
+                    ok = await self._play_one(track)
+
+                if ok:
+                    self._apply_loop(track)
+                    if not self.queue and self.autoplay:
+                        await self._queue_autoplay(track)
 
                 self.current = None
 
@@ -413,6 +565,10 @@ class MusicPlayer:
         log.info("playing %s", track.title)
 
         before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+        if track.seek_offset:
+            # -ss before the input seeks fast instead of decoding from zero.
+            before_options += f" -ss {track.seek_offset}"
+            track.seek_offset = 0
         if track.headers:
             # FFmpeg's default UA gets rejected by most CDNs, so replay the
             # exact headers yt-dlp said go with this stream.
@@ -444,12 +600,14 @@ class MusicPlayer:
             return False
 
         # poll until the track ends, a skip happens, or stop() cancels us
+        self.started_at = time.monotonic()
         while self.voice.is_playing() or self.voice.is_paused():
             await asyncio.sleep(0.5)
 
         # discord.py hands the after-callback its error a tick after playback
         # stops, so give it a moment before we look.
         await asyncio.sleep(0.2)
+        self.started_at = None
 
         error = errors[0] if errors else None
         if error is not None:
@@ -468,10 +626,132 @@ class MusicPlayer:
         self.current = None
         return error is None
 
+    def _apply_loop(self, track: Track) -> None:
+        """Put a finished track back in the queue when looping is on."""
+        if self.loop_mode == "song" and not self._skip_once:
+            self.queue.insert(0, track)
+        elif self.loop_mode == "queue":
+            self.queue.append(track)
+        if self._skip_once:
+            # /skip must move forward even with song-loop on, so ignore the
+            # loop exactly once instead of trapping the user in a replay.
+            self._skip_once = False
+
+    async def _queue_autoplay(self, finished: Track) -> None:
+        """Keep the music going with something similar when the queue runs dry.
+
+        Autoplay looks for tracks like the one that just ended and skips
+        anything already played recently, so it doesn't loop the same few
+        songs. It also stops if the bot is left alone in the channel.
+        """
+        if not self.voice.is_connected():
+            return
+        channel = self.voice.channel
+        if channel is not None and len([m for m in channel.members if not m.bot]) == 0:
+            log.info("autoplay off - nobody is listening")
+            return
+
+        self._recent.append(finished.title)
+        self._recent = self._recent[-15:]
+
+        try:
+            candidates = await asyncio.to_thread(
+                search_candidates, finished.title, limit=5
+            )
+        except (DownloadError, LookupError, ValueError) as exc:
+            log.warning("autoplay search failed: %s", exc)
+            return
+
+        for candidate in candidates:
+            if normalize(candidate["title"]) == normalize(finished.title):
+                continue
+            if any(normalize(candidate["title"]) == normalize(t) for t in self._recent):
+                continue
+            try:
+                track = await asyncio.to_thread(
+                    resolve_track, candidate["webpage_url"], finished.requested_by
+                )
+            except (DownloadError, LookupError, ValueError) as exc:
+                log.warning("autoplay could not resolve %s: %s", candidate["title"], exc)
+                continue
+            log.info("autoplay picked %s", track.title)
+            self.queue.append(track)
+            self._notify(f"Autoplay: **{track.title}**")
+            return
+
+        log.info("autoplay found nothing new to play")
+
     def _notify(self, message: str) -> None:
         """Best-effort notice in the channel that started playback."""
         if self.notify_channel:
             asyncio.create_task(self.notify_channel.send(message))
+
+
+class SearchPicker(discord.ui.View):
+    """A dropdown of search results that queues whichever one is picked.
+
+    Search and the actual resolve are kept apart on purpose: resolving pins a
+    stream URL that expires, and a human picking from a list can take a while.
+    """
+
+    def __init__(self, cog: "Music", results: list[dict]):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.results = results
+        self.message: discord.WebhookMessage | None = None
+
+        select = discord.ui.Select(
+            placeholder="Pick a song to play",
+            options=[
+                discord.SelectOption(
+                    label=result["title"][:100],
+                    description=short_duration(result["duration"]) or None,
+                    value=str(i),
+                )
+                for i, result in enumerate(results)
+            ],
+        )
+        select.callback = self.on_pick
+        self.add_item(select)
+
+    async def on_pick(self, interaction: discord.Interaction) -> None:
+        chosen = self.results[int(interaction.data["values"][0])]
+        self.stop()
+        await self._tidy()
+        await interaction.response.defer()
+
+        try:
+            track = await asyncio.wait_for(
+                asyncio.to_thread(
+                    resolve_track,
+                    chosen["webpage_url"],
+                    interaction.user.display_name,
+                ),
+                timeout=45,
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send("That took too long to load. Try again.")
+        except ValueError as exc:
+            await interaction.followup.send(str(exc))
+        except (DownloadError, LookupError):
+            await interaction.followup.send(f"I couldn't play **{chosen['title']}**.")
+        else:
+            await self.cog._queue_track(interaction, track, chosen["title"])
+
+    async def on_timeout(self) -> None:
+        self.stop()
+        await self._tidy()
+
+    async def _tidy(self) -> None:
+        """Remove the dropdown so nobody clicks a stale choice."""
+        if self.message is None:
+            return
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except discord.HTTPException:
+            log.debug("could not disable the search picker", exc_info=True)
 
 
 class Music(commands.Cog):
@@ -603,12 +883,21 @@ class Music(commands.Cog):
             return
 
         log.info("play: resolved %r -> %s", song, track.title)
+        await self._queue_track(interaction, track, song)
+
+    async def _queue_track(
+        self, interaction: discord.Interaction, track: Track, label: str
+    ) -> None:
+        """Connect, queue `track`, and reply. Caller must have deferred.
+
+        Shared by /play and /search so both behave identically.
+        """
         try:
             player, error = await asyncio.wait_for(
                 self.ensure_player(interaction), timeout=40
             )
         except asyncio.TimeoutError:
-            log.warning("voice connect timed out for %r", song)
+            log.warning("voice connect timed out for %r", label)
             await self._discard_voice(interaction.guild)
             await interaction.followup.send(
                 "CASE took too long to join the voice channel. Try again."
@@ -617,7 +906,7 @@ class Music(commands.Cog):
         if error:
             await interaction.followup.send(error)
             return
-        log.info("play: connected, queueing")
+        log.info("connected, queueing")
 
         was_idle = player.is_idle()
         player.notify_channel = interaction.channel
@@ -687,6 +976,94 @@ class Music(commands.Cog):
         await player.shutdown()
         await interaction.response.send_message("Stopped. The queue was cleared.")
 
+    @discord.app_commands.command(name="shuffle", description="Shuffle the queue.")
+    async def shuffle(self, interaction: discord.Interaction):
+        player = self.get_player(interaction.guild)
+        if player is None or not player.queue:
+            await interaction.response.send_message("There's nothing in the queue to shuffle.")
+            return
+        player.shuffle()
+        await interaction.response.send_message(
+            f"Shuffled {len(player.queue)} songs in the queue."
+        )
+
+    @discord.app_commands.command(name="remove", description="Remove one song from the queue.")
+    async def remove(self, interaction: discord.Interaction, position: int):
+        player = self.get_player(interaction.guild)
+        if player is None or not player.queue:
+            await interaction.response.send_message("There's nothing in the queue.")
+            return
+        if position < 1 or position > len(player.queue):
+            await interaction.response.send_message(
+                f"Pick a position between 1 and {len(player.queue)}."
+            )
+            return
+        removed = player.queue.pop(position - 1)
+        await interaction.response.send_message(f"Removed **{removed.title}** from the queue.")
+
+    @discord.app_commands.command(name="clear", description="Clear the queue but keep playing.")
+    async def clear(self, interaction: discord.Interaction):
+        player = self.get_player(interaction.guild)
+        if player is None or not player.queue:
+            await interaction.response.send_message("The queue is already empty.")
+            return
+        count = len(player.queue)
+        player.clear()
+        await interaction.response.send_message(
+            f"Cleared {count} songs. The current song keeps playing."
+        )
+
+    @discord.app_commands.command(name="jump", description="Skip ahead to a position in the queue.")
+    async def jump(self, interaction: discord.Interaction, position: int):
+        player = self.get_player(interaction.guild)
+        if player is None or not player.queue:
+            await interaction.response.send_message("There's nothing queued to jump to.")
+            return
+        if position < 1 or position > len(player.queue):
+            await interaction.response.send_message(
+                f"Pick a position between 1 and {len(player.queue)}."
+            )
+            return
+
+        target = player.queue[position - 1]
+        dropped = position - 1
+        player.queue = player.queue[position - 1:]
+        if player.current is None:
+            player.start()
+        else:
+            player.skip()
+        await interaction.response.send_message(
+            f"Jumped to **{target.title}**" + (f", dropped {dropped} song(s)." if dropped else ".")
+        )
+
+    @discord.app_commands.command(
+        name="loop", description="Repeat the current song, the whole queue, or turn it off."
+    )
+    async def loop(self, interaction: discord.Interaction, mode: str):
+        player = self.get_player(interaction.guild)
+        if player is None:
+            await interaction.response.send_message("Nothing is playing right now.")
+            return
+        if mode not in ("off", "song", "queue"):
+            await interaction.response.send_message("Mode must be off, song, or queue.")
+            return
+        player.loop_mode = mode
+        label = {"off": "Loop is off.", "song": "Looping the current song.", "queue": "Looping the whole queue."}
+        await interaction.response.send_message(label[mode])
+
+    @loop.autocomplete("mode")
+    async def loop_autocomplete(self, interaction: discord.Interaction, current: str):
+        player = self.get_player(interaction.guild)
+        options = ["off", "song", "queue"]
+        if player and player.loop_mode in options:
+            options.remove(player.loop_mode)
+            options.insert(0, player.loop_mode)
+        return [
+            discord.app_commands.Choice(name=m, value=m)
+            for m in options
+            if current.lower() in m
+        ]
+
     @discord.app_commands.command(name="queue", description="Show the current queue.")
     async def queue(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild)
@@ -721,6 +1098,126 @@ class Music(commands.Cog):
         await interaction.response.send_message(
             embed=self._now_playing_embed(player.current, player)
         )
+
+    @discord.app_commands.command(name="seek", description="Jump to a spot in the current song.")
+    async def seek(self, interaction: discord.Interaction, position: str):
+        player = self.get_player(interaction.guild)
+        if player is None or player.current is None:
+            await interaction.response.send_message("Nothing is playing right now.")
+            return
+
+        try:
+            seconds = parse_timestamp(position)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc))
+            return
+
+        total = player.current.duration
+        if total and seconds >= total:
+            await interaction.response.send_message(
+                f"That song is only {player.current.duration_label()} long."
+            )
+            return
+
+        if not player.seek(seconds):
+            await interaction.response.send_message("Couldn't seek right now. Try again.")
+            return
+        await interaction.response.send_message(
+            f"Seeked to **{seconds // 60}:{seconds % 60:02d}** in **{player.current.title}**."
+        )
+
+    @discord.app_commands.command(
+        name="search", description="Search and pick from a list before playing."
+    )
+    async def search(self, interaction: discord.Interaction, query: str):
+        await interaction.response.defer(ephemeral=True)
+
+        # An exact local match is unambiguous, so don't make them pick it.
+        path = find_song(query)
+        if path is not None:
+            await interaction.followup.send(
+                f"That's **{path.name}** in music/ - use `/play {path.stem}` to play it."
+            )
+            return
+
+        try:
+            results = await asyncio.wait_for(
+                asyncio.to_thread(search_candidates, query), timeout=30
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send("The search took too long. Try a shorter query.")
+            return
+        except ValueError as exc:
+            await interaction.followup.send(str(exc))
+            return
+        except (DownloadError, LookupError):
+            await interaction.followup.send(f"I couldn't find anything for **{query}**.")
+            return
+
+        picker = SearchPicker(self, results)
+        picker.message = await interaction.followup.send(
+            f"Results for **{query}** - pick one:", view=picker, wait=True
+        )
+
+    @discord.app_commands.command(
+        name="lyrics", description="Lyrics for the current song, or any search."
+    )
+    async def lyrics(self, interaction: discord.Interaction, query: str | None = None):
+        player = self.get_player(interaction.guild)
+        if query is None:
+            if player is None or player.current is None:
+                await interaction.response.send_message(
+                    "Nothing is playing - try `/lyrics brown rang` instead."
+                )
+                return
+            query = player.current.title
+
+        await interaction.response.defer()
+
+        # YouTube titles carry junk like "| Artist" and "(Official Video)".
+        # lrclib matches better on a trimmed version, so try the full one first.
+        trimmed = re.split(r"\s+\|\s+|\s+-\s+", query)[0].strip()
+
+        item = await fetch_lyrics(query)
+        if item is None and trimmed and trimmed.lower() != query.lower():
+            item = await fetch_lyrics(trimmed)
+
+        if item is None:
+            await interaction.followup.send(f"I couldn't find lyrics for **{query}**.")
+            return
+
+        text = item["plainLyrics"].strip()
+        if len(text) > 3900:
+            # Discord cuts embeds off at 4096, leave room for the title.
+            text = text[:3900].rsplit("\n", 1)[0] + "\n…"
+
+        embed = discord.Embed(
+            title=item.get("trackName") or trimmed or query,
+            description=text,
+            colour=discord.Colour.blurple(),
+        )
+        if item.get("artistName"):
+            embed.set_author(name=item["artistName"])
+        await interaction.followup.send(embed=embed)
+
+    @discord.app_commands.command(
+        name="autoplay", description="Keep playing similar songs automatically."
+    )
+    async def autoplay(self, interaction: discord.Interaction):
+        player = self.get_player(interaction.guild)
+        if player is None:
+            await interaction.response.send_message(
+                "Play something first - autoplay needs a song to go on from."
+            )
+            return
+
+        player.autoplay = not player.autoplay
+        if player.autoplay:
+            await interaction.response.send_message(
+                "Autoplay **on**. When the queue runs out I'll pick similar songs."
+            )
+        else:
+            await interaction.response.send_message("Autoplay **off**.")
 
     @discord.app_commands.command(name="history", description="Show recently played songs.")
     async def history(self, interaction: discord.Interaction):
@@ -763,6 +1260,27 @@ class Music(commands.Cog):
             inline=True,
         )
         embed.add_field(name="Requested by", value=track.requested_by, inline=True)
+
+        if track.duration:
+            elapsed = min(player.elapsed(), track.duration)
+            embed.add_field(
+                name="Progress",
+                value=(
+                    f"`{elapsed // 60}:{elapsed % 60:02d}` "
+                    f"{progress_bar(elapsed, track.duration)} "
+                    f"`{track.duration_label()}`"
+                ),
+                inline=False,
+            )
+
+        flags = []
+        if player.loop_mode != "off":
+            flags.append(f"loop: {player.loop_mode}")
+        if player.autoplay:
+            flags.append("autoplay")
+        if flags:
+            embed.add_field(name="Modes", value=" · ".join(flags), inline=True)
+
         if track.webpage_url:
             embed.url = track.webpage_url
         if player.queue:
