@@ -423,6 +423,10 @@ class _YDLLogger:
 
 YDL_OPTIONS = {
     "format": "bestaudio/best",
+    # Pick by bitrate, not by container. yt-dlp otherwise prefers m4a over mp3
+    # and hands SoundCloud back a 96k AAC stream when a 128k MP3 exists - and
+    # nobody wants 96k.
+    "format_sort": ["abr"],
     "noplaylist": True,
     # Without this, a playlist link walks every entry (~160s for a big set)
     # and the command sits at "thinking" the whole time. We only ever play
@@ -654,9 +658,10 @@ def search_soundcloud(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 def _soundcloud_info(query: str, limit: int = 5) -> dict | None:
     """First usable SoundCloud match for a plain query - or None.
 
-    SoundCloud goes first: it streams happily from a data-centre IP with no
-    sign-in and no bot check. Its search is loose though, so the match has to
-    actually relate to the query - otherwise JioSaavn gets the turn.
+    Tried after JioSaavn: SoundCloud answers from a data-centre IP without a
+    sign-in and without a bot check, but its best is 128k. Its search is
+    loose too, so the match has to actually relate to the query - otherwise
+    YouTube gets the turn.
     """
     try:
         matches = search_soundcloud(query, limit=limit)
@@ -717,9 +722,10 @@ def resolve_track(query: str, requested_by: str) -> Track:
     """Turn a /play argument into a Track.
 
     Local files win over the internet so you can always play your own
-    versions by name. Plain queries go to SoundCloud first (no bot check for
-    a data-centre IP), then to JioSaavn, then to yt-dlp - which is also what
-    handles a YouTube or SoundCloud link you paste in yourself.
+    versions by name. Plain queries go to JioSaavn first - it streams 320k
+    with no account and no bot check - then to SoundCloud (128k is its
+    best without logging in), then to yt-dlp, which is also what handles a
+    YouTube or SoundCloud link you paste in yourself.
 
     Blocking, so it must run in a thread.
     """
@@ -736,19 +742,19 @@ def resolve_track(query: str, requested_by: str) -> Track:
         return Track.from_file(path, requested_by)
 
     if not is_url(query):
-        sc_info = _soundcloud_info(query)
-        if sc_info:
-            try:
-                return _build_track(sc_info, query, requested_by)
-            except LookupError:
-                log.warning("soundcloud had no playable stream for %r", query)
-
         jsaavn_info = _jiosaavn_info(query)
         if jsaavn_info:
             try:
                 return _build_track(jsaavn_info, query, requested_by)
             except LookupError:
                 log.warning("jiosaavn had no playable stream for %r", query)
+
+        sc_info = _soundcloud_info(query)
+        if sc_info:
+            try:
+                return _build_track(sc_info, query, requested_by)
+            except LookupError:
+                log.warning("soundcloud had no playable stream for %r", query)
 
     info: dict | None = None
     last_error: Exception | None = None
@@ -794,22 +800,23 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
         raise ValueError(reason)
 
     # Same order as /play, so the picker shows what pressing Enter would do:
-    # SoundCloud, then JioSaavn, and only then YouTube.
+    # Same order as /play, so the picker shows what pressing Enter would do:
+    # JioSaavn (320k), then SoundCloud (128k), and only then YouTube.
     results = []
     try:
-        matches = search_soundcloud(query, limit)
-        results = [m for m in matches if _related_to(m, query)]
-        log.info("soundcloud search: %d result(s)", len(results))
+        results = search_jiosaavn(query, limit)
+        log.info("jiosaavn search: %d result(s)", len(results))
     except Exception as exc:
-        log.warning("soundcloud search failed: %s", reason_line(exc))
+        log.warning("jiosaavn search failed: %s", reason_line(exc))
         results = []
 
     if not results:
         try:
-            results = search_jiosaavn(query, limit)
-            log.info("jiosaavn search: %d result(s)", len(results))
+            matches = search_soundcloud(query, limit)
+            results = [m for m in matches if _related_to(m, query)]
+            log.info("soundcloud search: %d result(s)", len(results))
         except Exception as exc:
-            log.warning("jiosaavn search failed: %s", reason_line(exc))
+            log.warning("soundcloud search failed: %s", reason_line(exc))
             results = []
 
     if not results:
