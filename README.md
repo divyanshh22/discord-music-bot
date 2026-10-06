@@ -1,11 +1,11 @@
 # Audira
 
-A personal Discord music bot I built to learn Discord bot development from the ground up.
-It plays local audio files, so you can actually see how the voice/audio layer works
-before adding anything more complicated like YouTube or Lavalink.
+A personal Discord music bot: one command plays a song in your voice channel.
+It plays matching files from `music/`, and for anything else it searches
+**JioSaavn** (320k) first, then **SoundCloud** and **YouTube** — which is also
+what a pasted link uses.
 
-Built for my own private server. Version 1 is local files only — no database, no Redis,
-no cloud anything.
+Built for my own private server.
 
 ## Features
 
@@ -172,18 +172,12 @@ music/
 
 ## Deploying to Render
 
-`render.yaml` describes the whole setup: one **Web Service** (Render's free
-plan has no background workers) plus a free **PostgreSQL** database.
-
 1. Push this repo to GitHub.
-2. On Render choose **New + → Blueprint** and point it at the repo.
-3. Add an environment variable `DISCORD_TOKEN` with your bot token
-   (it is left blank on purpose, `sync: false`).
-4. Deploy. Render creates `case-db` and passes its connection string to the
-   bot as `DATABASE_URL` automatically.
-
-Audira listens on `$PORT` so Render's health check passes, and the Discord
-connection itself is outbound, so no extra networking is needed.
+2. On Render, create a **Web Service** from the repo (branch `main`).
+3. In your `.env` or as Render env vars: `DISCORD_TOKEN`. Add a
+   `DATABASE_URL` too if you want `/history`.
+4. Paste the build command below in **Settings → Build & Deploy**.
+5. Deploy. Render's health check passes because Audira listens on `$PORT`.
 
 ### The PO-token provider
 
@@ -205,14 +199,3 @@ Audira runs fine without it - it just cannot play from a flagged IP.
 
 Free-tier caveats: the web service spins down after ~15 min of no HTTP
 traffic, and the free Postgres database expires after 30 days.
-
-## Roadmap
-
-Roughly in the order I expect to attempt them:
-
-- **Controls** — `/remove`, `/clear`, `/shuffle`, `/loop`, `/volume`
-- **Audio source layer** — separate track resolution from playback so online
-  sources can be added without rewriting the player
-- **Buttons** — pause/skip/stop controls on the Now Playing embed
-- **Persistence** — SQLite for per-server settings (DJ role, default channel)
-- **Deployment** — logging, restart handling, Docker if it earns its place

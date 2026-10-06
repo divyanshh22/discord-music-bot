@@ -1,9 +1,4 @@
-"""PostgreSQL storage for CASE.
-
-Everything here is optional. Without a DATABASE_URL the bot runs exactly
-like before and /history simply reports that no database is configured, so
-local development never needs a Postgres server running.
-"""
+"""PostgreSQL storage for CASE. Everything here is optional. Without a DATABASE_URL the bot runs exactly like before and /history simply reports that no databas..."""
 
 from __future__ import annotations
 
@@ -15,7 +10,7 @@ log = logging.getLogger("case")
 
 _pool: asyncpg.Pool | None = None
 
-# One table: every track that actually finished playing, newest last.
+
 SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS play_history (
@@ -44,11 +39,7 @@ def normalise_dsn(dsn: str) -> str:
 
 
 async def connect(dsn: str | None) -> bool:
-    """Open the pool and create the tables. Returns False when unusable.
-
-    A missing URL or a rejected connection is not fatal - the bot keeps
-    running without a history feature rather than refusing to start.
-    """
+    """Open the pool and create the tables."""
     global _pool
 
     if not dsn:
@@ -56,7 +47,7 @@ async def connect(dsn: str | None) -> bool:
         return False
 
     try:
-        # connect_timeout keeps a dead database from stalling startup.
+
         _pool = await asyncpg.create_pool(
             normalise_dsn(dsn), min_size=1, max_size=5, timeout=10
         )
@@ -93,11 +84,7 @@ async def log_play(
     requested_by: str = "someone",
     duration: int | None = None,
 ) -> None:
-    """Remember one track that played. Swallows its own errors.
-
-    Losing a history row is never worth interrupting playback for, so any
-    failure here is logged and forgotten.
-    """
+    """Remember one track that played. Swallows its own errors. Losing a history row is never worth interrupting playback for, so any failure here is logged and for..."""
     if _pool is None:
         return
 

@@ -28,36 +28,36 @@ class General(commands.Cog):
         )
         embed.add_field(
             name="General",
-            value="`/ping` — check latency\n`/help` — show this list",
+            value="`/ping` ΓÇö check latency\n`/help` ΓÇö show this list",
             inline=False,
         )
         embed.add_field(
             name="Playback",
             value=(
-                "`/play <song>` — play by name, link, or local file\n"
-                "`/search <query>` — pick from a list before playing\n"
-                "`/pause` · `/resume` · `/skip` · `/stop`\n"
-                "`/seek 1:30` — jump inside the current song\n"
-                "`/lyrics` — lyrics for what's playing (or any search)"
+                "`/play <song>` ΓÇö play by name, link, or local file\n"
+                "`/search <query>` ΓÇö pick from a list before playing\n"
+                "`/pause` ┬╖ `/resume` ┬╖ `/skip` ┬╖ `/stop`\n"
+                "`/seek 1:30` ΓÇö jump inside the current song\n"
+                "`/lyrics` ΓÇö lyrics for what's playing (or any search)"
             ),
             inline=False,
         )
         embed.add_field(
             name="Queue",
             value=(
-                "`/queue` — show what's up next\n"
-                "`/shuffle` — randomise the queue\n"
-                "`/remove <n>` · `/clear` · `/jump <n>`\n"
-                "`/loop off|song|queue` — repeat\n"
-                "`/autoplay` — keep playing similar songs\n"
-                "`/nowplaying` — current song with progress\n"
-                "`/history` — recently played songs"
+                "`/queue` ΓÇö show what's up next\n"
+                "`/shuffle` ΓÇö randomise the queue\n"
+                "`/remove <n>` ┬╖ `/clear` ┬╖ `/jump <n>`\n"
+                "`/loop off|song|queue` ΓÇö repeat\n"
+                "`/autoplay` ΓÇö keep playing similar songs\n"
+                "`/nowplaying` ΓÇö current song with progress\n"
+                "`/history` ΓÇö recently played songs"
             ),
             inline=False,
         )
         embed.add_field(
             name="Voice",
-            value="`/join` — join your voice channel\n`/leave` — leave the voice channel",
+            value="`/join` ΓÇö join your voice channel\n`/leave` ΓÇö leave the voice channel",
             inline=False,
         )
         embed.set_footer(

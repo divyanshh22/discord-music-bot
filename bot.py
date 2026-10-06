@@ -13,27 +13,22 @@ import db
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s %(message)s")
 log = logging.getLogger("case")
 
-# We only use slash commands, so we do not need the message_content intent.
-# Nothing in the Developer Portal needs to be enabled as a privileged intent.
+
+
 intents = discord.Intents.default()
 
 client = commands.Bot(command_prefix="!", intents=intents)
 
 
 async def start_health_server() -> None:
-    """Answer on $PORT so Render treats this as a healthy web service.
-
-    Render's free tier has no background workers, only web services, and a
-    web service that never binds a port is marked dead. This does nothing
-    locally because $PORT is unset on your own machine.
-    """
+    """Answer on $PORT so Render treats this as a healthy web service."""
     if not config.PORT:
         return
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            # Read only the request headers. Reading until EOF would hang,
-            # because the client keeps its side open waiting for our reply.
+
+
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=5)
                 if not line or line in (b"\r\n", b"\n"):
@@ -58,7 +53,7 @@ async def start_health_server() -> None:
 
 
 async def load_cogs():
-    # every .py file in cogs/ is a feature group with its own commands
+
     for path in Path(__file__).parent.joinpath("cogs").glob("*.py"):
         name = path.stem
         if name.startswith("_"):
@@ -73,17 +68,17 @@ async def on_ready():
     log.info("connected to %s guild(s)", len(client.guilds))
     log.info("connected listeners: %s", len(client.extra_events))
 
-    # Sync to the guild instead of globally. Global commands can take up to an
-    # hour to appear, guild ones show up right away - better for a single server.
+
+
     for guild in client.guilds:
         await client.tree.sync(guild=guild)
         log.info("synced %s command(s) to %s", len(client.tree.get_commands()), guild.name)
 
-    # drop any stale global registrations so nothing shows up twice
+
     if await client.tree.sync():
         log.info("cleared old global commands")
 
-    await client.change_presence(activity=discord.Game(name="music 🎵"))
+    await client.change_presence(activity=discord.Game(name="music ≡ƒÄ╡"))
     log.info("play history database: %s", "on" if db.available() else "off")
 
 
@@ -111,8 +106,8 @@ async def main():
     try:
         async with client:
             await load_cogs()
-            # Health server first: if the database is slow to answer we still
-            # answer Render's health checks instead of failing the deploy.
+
+
             await start_health_server()
             await db.connect(config.DATABASE_URL)
             await client.start(config.TOKEN)

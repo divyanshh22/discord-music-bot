@@ -29,13 +29,13 @@ log = logging.getLogger("case")
 
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".ogg", ".m4a", ".flac")
 
-# Where FFmpeg usually lands on Windows, checked when it isn't on PATH yet.
+
 FFMPEG_FALLBACK_PATHS = (
     Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links",
     Path("C:/ffmpeg/bin"),
     Path("C:/Program Files/ffmpeg/bin"),
     Path("C:/ProgramData/chocolatey/bin"),
-    # heroku-buildpack-ffmpeg-static unpacks here on a Linux dyno
+
     Path("/app/vendor/ffmpeg/bin"),
 )
 
@@ -46,12 +46,7 @@ FFMPEG_MISSING = (
 
 
 def find_ffmpeg() -> str | None:
-    """Locate the ffmpeg binary, or None if it isn't installed.
-
-    FFmpeg is an external program, not a Python package. A terminal opened
-    before FFmpeg was installed keeps the old PATH, so we also check the
-    usual install locations.
-    """
+    """Locate the ffmpeg binary, or None if it isn't installed."""
     found = shutil.which("ffmpeg")
     if found:
         return found
@@ -125,9 +120,9 @@ def parse_timestamp(text: str) -> int:
 def progress_bar(elapsed: int, total: int, width: int = 20) -> str:
     """A compact slider like `------*-------------` for embeds."""
     if not total:
-        return "♪" * width
+        return "ΓÖ¬" * width
     filled = max(0, min(width, round(width * elapsed / total)))
-    return "▓" * filled + "░" * (width - filled)
+    return "Γûô" * filled + "Γûæ" * (width - filled)
 
 
 def short_duration(seconds: int | None) -> str:
@@ -141,12 +136,7 @@ def short_duration(seconds: int | None) -> str:
 
 
 def reason_line(exc: Exception) -> str:
-    """One short line for a yt-dlp failure, so the reply can show why.
-
-    yt-dlp errors are often multi-line stacks with a URL on the first line
-    and the actual problem ("Sign in to confirm you're not a bot") on the
-    last, so the last non-empty line is the useful one.
-    """
+    """One short line for a yt-dlp failure, so the reply can show why."""
     lines = [line.strip() for line in str(exc).strip().splitlines() if line.strip()]
     text = type(exc).__name__
     for line in lines:
@@ -175,16 +165,11 @@ def _words(text: str) -> set[str]:
 
 
 def _autoplay_key(title: str) -> str:
-    """A title reduced to its core, so editions count as one song.
-
-    'Hale Dil (From "Murder 2")', 'Hale Dil (Acoustic)' and plain 'Hale
-    Dil' all collapse to 'dil hale': autoplay must not hand back a different
-    artist or edition of the very song that just ended.
-    """
+    """A title reduced to its core, so editions count as one song."""
     text = title or ""
     text = re.sub(r"\([^)]*\)", " ", text)
     text = re.sub(r"\[[^\]]*\]", " ", text)
-    text = re.sub(r"[|/·–—]", " ", text)
+    text = re.sub(r"[|/┬╖ΓÇôΓÇö]", " ", text)
     words = _words(text) - {
         "official",
         "hd",
@@ -203,15 +188,7 @@ def _autoplay_key(title: str) -> str:
 
 
 def _related_to(candidate: dict, query: str) -> bool:
-    """True when a search result really is about what we searched for.
-
-    Search APIs answer almost anything with something, so we need to tell a
-    song matching the query apart from one that merely ranks well. Two shared
-    words (or the only one, for a one-word query) is enough - plus any result
-    that is simply a shorter form of the query, so a long YouTube title still
-    matches its own short name. That keeps "hale dil by murder" pointing at
-    "Hale Dil Murder2" while rejecting a song that only contains "band".
-    """
+    """True when a search result really is about what we searched for."""
     wanted = _words(query)
     found = _words(candidate.get("title")) | _words(candidate.get("artist"))
     if not wanted or not found:
@@ -223,12 +200,7 @@ def _related_to(candidate: dict, query: str) -> bool:
 
 
 def lyrics_score(item: dict, title: str, artist: str | None, duration: int | None) -> int:
-    """Confidence that `item` is the same song. 0 means "not this song".
-
-    lrclib's search is loose, so the first hit is often a different track
-    entirely. A score of 3+ needs the titles to match (equal or one inside
-    the other); artist and duration only break ties between close matches.
-    """
+    """Confidence that `item` is the same song."""
     want, got = _lyrics_key(title), _lyrics_key(item.get("trackName") or "")
     if not want or not got:
         return 0
@@ -263,16 +235,12 @@ def lyrics_score(item: dict, title: str, artist: str | None, duration: int | Non
 async def fetch_lyrics(
     query: str, *, artist: str | None = None, duration: int | None = None
 ) -> dict | None:
-    """Best matching lyrics for `query` from lrclib.net - free, no API key.
-
-    Returns the raw result (it has plainLyrics/artistName/...) or None when
-    nothing looks like the same song - a wrong answer is worse than none.
-    """
+    """Best matching lyrics for `query` from lrclib.net - free, no API key."""
     timeout = aiohttp.ClientTimeout(total=10)
     results: list = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        # lrclib answers 503 now and then; a couple of retries turns most of
-        # those "couldn't find lyrics" moments into results.
+
+
         for attempt in range(3):
             try:
                 async with session.get(LRCLIB_SEARCH, params={"q": query}) as resp:
@@ -302,9 +270,9 @@ async def fetch_lyrics(
     return best
 
 
-# Sites that never hand over playable audio - either they only expose
-# metadata through an API, or the stream is DRM-encrypted. yt-dlp refuses
-# these with a long traceback nobody wants to read, so we catch them first.
+
+
+
 UNSUPPORTED_DOMAINS = {
     "spotify.com": (
         "Spotify can't be played directly - copy the song name "
@@ -343,12 +311,7 @@ def unsupported_reason(text: str) -> str | None:
 
 
 def find_song(query: str) -> Path | None:
-    """Look for a local file in music/ matching the query.
-
-    Tries an exact name match first, then a partial match. Spaces, underscores
-    and a trailing .mp3 are all treated the same, so "shape of you",
-    "shape_of_you" and "Shape of You.mp3" all find shape_of_you.mp3.
-    """
+    """Look for a local file in music/ matching the query."""
     query = normalize(query)
     if not query:
         return None
@@ -369,13 +332,7 @@ def find_song(query: str) -> Path | None:
 
 
 class Track:
-    """One item in the queue.
-
-    A track is either a file in music/ or a stream resolved by yt-dlp.
-    `source` is what gets handed to FFmpeg: a path for local files, a URL for
-    streams. The player only ever reads `.source`, so both kinds play the
-    same way and nothing downstream needs to know where the audio came from.
-    """
+    """One item in the queue. A track is either a file in music/ or a stream resolved by yt-dlp. `source` is what gets handed to FFmpeg: a path for local files, a U..."""
 
     def __init__(
         self,
@@ -394,19 +351,19 @@ class Track:
         self.requested_by = requested_by
         self.duration = duration
         self.webpage_url = webpage_url
-        # HTTP headers yt-dlp says go with this stream. FFmpeg needs them too,
-        # otherwise the CDN answers 403 because the request looks automated.
+
+
         self.headers = headers or {}
-        # Who made it, when the source says so. Autoplay leans on this to
-        # find something in the same lane as the song that just ended.
+
+
         self.artist = artist
-        # Cover art for the now-playing card, when the source provides one.
+
         self.thumbnail = thumbnail
-        # True when a command already posted the now-playing card for this
-        # track, so starting it does not post a second one.
+
+
         self.announced = False
-        # A temporary file backing this track (a /seek cut). Deleted once the
-        # track is done playing so repeated seeks can't pile up disk usage.
+
+
         self.temp_path = temp_path
 
     def cleanup(self) -> None:
@@ -439,15 +396,11 @@ class Track:
 
 
 class _YDLLogger:
-    """Keeps yt-dlp's own console output out of the terminal.
-
-    yt-dlp prints directly to stdout/stderr otherwise, which mixes ugly
-    ERROR blocks into CASE's log. Route it through logging instead.
-    """
+    """Keeps yt-dlp's own console output out of the terminal."""
 
     def debug(self, msg: str) -> None:
-        # yt-dlp hides PO-token progress in debug output, and that is exactly
-        # what we need to see when YouTube starts challenging our IP.
+
+
         if "[pot" in msg or "PO Token" in msg:
             log.info("yt-dlp: %s", msg)
         else:
@@ -462,31 +415,31 @@ class _YDLLogger:
 
 YDL_OPTIONS = {
     "format": "bestaudio/best",
-    # Pick by bitrate, not by container. yt-dlp otherwise prefers m4a over mp3
-    # and hands SoundCloud back a 96k AAC stream when a 128k MP3 exists - and
-    # nobody wants 96k.
+
+
+
     "format_sort": ["abr"],
     "noplaylist": True,
-    # Without this, a playlist link walks every entry (~160s for a big set)
-    # and the command sits at "thinking" the whole time. We only ever play
-    # the first track, so stop yt-dlp there.
+
+
+
     "playlist_items": "1",
     "quiet": True,
     "no_warnings": True,
     "nocheckcertificate": True,
     "default_search": "ytsearch1",
-    # yt-dlp retries a failing request 10 times by default, which can eat the
-    # whole command timeout on a network YouTube distrusts. Give up quickly so
-    # the next player client gets a turn.
+
+
+
     "retries": 1,
     "fragment_retries": 1,
     "socket_timeout": 15,
     "logger": _YDLLogger(),
 }
 
-# yt-dlp needs a JavaScript runtime to unlock YouTube's signatures. Without
-# one it warns on every resolve and hands back stream URLs YouTube rejects
-# with HTTP 403 a moment after FFmpeg opens them.
+
+
+
 _NODE = find_node()
 if _NODE:
     YDL_OPTIONS["js_runtimes"] = {"node": {"path": _NODE}}
@@ -494,14 +447,14 @@ if _NODE:
 else:
     log.warning("node.js not found - some YouTube streams may fail with 403")
 
-# Both are external programs, so check them once at startup instead of
-# discovering a missing one when someone runs /play.
+
+
 log.info("ffmpeg: %s", find_ffmpeg() or "MISSING")
 
-# YouTube wants a proof-of-origin token from data-centre IPs, which yt-dlp
-# cannot make on its own. bgutil generates one with node.js; the build clones
-# and compiles it into potprovider/. On a home IP the token is never needed,
-# so a missing provider is only a warning.
+
+
+
+
 _POT_SCRIPT = config.BASE_DIR / "potprovider" / "server" / "build" / "generate_once.js"
 if _POT_SCRIPT.exists() and _NODE:
     YDL_OPTIONS["extractor_args"] = {
@@ -513,11 +466,7 @@ else:
 
 
 def _cookie_file(value: str) -> str:
-    """Turn YOUTUBE_COOKIES into a path yt-dlp can read.
-
-    Accepts either a path to a cookies.txt (handy on our own machine) or the
-    file's base64, because Render's environment variables are single-line.
-    """
+    """Turn YOUTUBE_COOKIES into a path yt-dlp can read."""
     raw = value.strip()
     path = Path(raw)
     if path.is_file():
@@ -528,9 +477,9 @@ def _cookie_file(value: str) -> str:
     return str(target)
 
 
-# A PO token alone rarely satisfies YouTube from a data-centre IP - its own
-# docs say to add cookies as well. Off unless YOUTUBE_COOKIES is set, so a
-# home connection needs nothing.
+
+
+
 _COOKIES = os.getenv("YOUTUBE_COOKIES")
 if _COOKIES:
     try:
@@ -543,11 +492,11 @@ else:
 
 MAX_RESULTS = 5
 
-# YouTube treats data-centre IPs (Render, VPS, ...) as suspicious and answers
-# its default browser client with "Sign in to confirm you're not a bot". The
-# TV/mweb clients are checked far less strictly, so on a hosted network we
-# fall back through them before giving up. On a home connection the first
-# attempt wins and the rest never run.
+
+
+
+
+
 YOUTUBE_CLIENT_ATTEMPTS: list[dict] = [
     {},
     {"extractor_args": {"youtube": {"player_client": ["tv", "web_safari"]}}},
@@ -556,12 +505,7 @@ YOUTUBE_CLIENT_ATTEMPTS: list[dict] = [
 
 
 def _merge_options(extra: dict) -> dict:
-    """A copy of YDL_OPTIONS with one fallback attempt applied.
-
-    The attempts only touch `youtube:player_client`, so their extractor_args
-    are merged key-by-key - otherwise the PO-token provider configured above
-    would be thrown away on every retry.
-    """
+    """A copy of YDL_OPTIONS with one fallback attempt applied."""
     options = {**YDL_OPTIONS, **extra}
     if "extractor_args" in extra:
         options["extractor_args"] = {
@@ -593,7 +537,7 @@ def _extract_once(options: dict, query: str) -> dict | None:
             if not entries:
                 raise LookupError("empty playlist")
             info = entries[0]
-            # flat entries only carry an id/title - force the real stream details
+
             if not info.get("url") and not info.get("formats"):
                 info = ydl.process_ie_result(info, download=False)
 
@@ -604,11 +548,7 @@ JIOSAAVN_API = "https://www.jiosaavn.com/api.php"
 
 
 def search_jiosaavn(query: str, limit: int = MAX_RESULTS) -> list[dict]:
-    """Top songs for a query from JioSaavn - no account, no bot check.
-
-    Returns the same shape as search_candidates so /search can fall back to
-    it when YouTube refuses our IP. Runs in a thread: it blocks on urllib.
-    """
+    """Top songs for a query from JioSaavn - no account, no bot check."""
     params = urlencode(
         {
             "_format": "json",
@@ -648,11 +588,7 @@ def search_jiosaavn(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 
 def _jiosaavn_info(query: str) -> dict | None:
-    """First JioSaavn match for a plain query, fully resolved - or None.
-
-    Any failure just means "let the next source have a go", so nothing
-    propagates.
-    """
+    """First JioSaavn match for a plain query, fully resolved - or None. Any failure just means "let the next source have a go", so nothing propagates."""
     try:
         matches = search_jiosaavn(query, limit=1)
         if not matches:
@@ -667,13 +603,7 @@ def _jiosaavn_info(query: str) -> dict | None:
 
 
 def search_soundcloud(query: str, limit: int = MAX_RESULTS) -> list[dict]:
-    """SoundCloud matches for a plain query, in the shape search_candidates uses.
-
-    Results stay flat: a page link is all /search shows and all _extract_once
-    needs later. The search arrives as a playlist, so noplaylist (which /play
-    sets for YouTube links) has to come off. Runs in a thread: it blocks on
-    yt-dlp.
-    """
+    """SoundCloud matches for a plain query, in the shape search_candidates uses."""
     options = {**YDL_OPTIONS, "noplaylist": False, "extract_flat": "in_playlist"}
     options.pop("playlist_items", None)
     with YoutubeDL(options) as ydl:
@@ -695,13 +625,7 @@ def search_soundcloud(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 
 def _soundcloud_info(query: str, limit: int = 5) -> dict | None:
-    """First usable SoundCloud match for a plain query - or None.
-
-    Tried after JioSaavn: SoundCloud answers from a data-centre IP without a
-    sign-in and without a bot check, but its best is 128k. Its search is
-    loose too, so the match has to actually relate to the query - otherwise
-    YouTube gets the turn.
-    """
+    """First usable SoundCloud match for a plain query - or None."""
     try:
         matches = search_soundcloud(query, limit=limit)
     except Exception as exc:
@@ -730,7 +654,7 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
     """Turn an extraction result into a playable Track."""
     url = info.get("url")
     if not url:
-        # some sites only hand back formats, not a resolved stream url
+
         formats = [f for f in info.get("formats", []) if f.get("url")]
         if not formats:
             raise LookupError("no playable stream for that track")
@@ -758,14 +682,7 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
 
 
 def _cut_track(track: Track, seconds: int) -> Track | None:
-    """Return a temporary file copy of `track` starting at `seconds`.
-
-    Seeking straight into a URL (/seek's old way) asked the CDN for a remote
-    byte range, and some CDNs answered with silence. Cutting a local file
-    instead always produces audio - the seek happens in a thread while the
-    current song keeps playing, and the result plays exactly like any local
-    file. Returns the original track untouched when there is nothing to cut.
-    """
+    """Return a temporary file copy of `track` starting at `seconds`."""
     if seconds <= 0:
         return track
 
@@ -781,8 +698,8 @@ def _cut_track(track: Track, seconds: int) -> Track | None:
     if not ffmpeg:
         return None
 
-    # Copy the audio as-is (fast). If the file format fights a raw copy,
-    # remux through an encoder - the container gets picked from the suffix.
+
+
     for extra in (["-c:a", "copy"], []):
         command = [ffmpeg, *shlex.split(before), "-i", track.source, "-vn", *extra, "-y", target]
         try:
@@ -813,16 +730,7 @@ def _cut_track(track: Track, seconds: int) -> Track | None:
 
 
 def resolve_track(query: str, requested_by: str) -> Track:
-    """Turn a /play argument into a Track.
-
-    Local files win over the internet so you can always play your own
-    versions by name. Plain queries go to JioSaavn first - it streams 320k
-    with no account and no bot check - then to SoundCloud (128k is its
-    best without logging in), then to yt-dlp, which is also what handles a
-    YouTube or SoundCloud link you paste in yourself.
-
-    Blocking, so it must run in a thread.
-    """
+    """Turn a /play argument into a Track."""
     query = query.strip()
     if not query:
         raise ValueError("empty query")
@@ -860,8 +768,8 @@ def resolve_track(query: str, requested_by: str) -> Track:
             info = _extract_once(_merge_options(extra), query)
             break
         except DownloadError as exc:
-            # Only a rejected client is worth retrying - our own LookupError
-            # ("no results") would fail identically with every client.
+
+
             last_error = exc
             log.warning(
                 "client attempt %d failed after %.1fs: %s",
@@ -879,12 +787,7 @@ def resolve_track(query: str, requested_by: str) -> Track:
 
 
 def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
-    """Top results for a query, without resolving a stream URL yet.
-
-    Flat extraction is fast, which matters because /search shows a picker and
-    the user may take a while to choose - by then a resolved stream URL would
-    have gone stale. The picked result is resolved properly at play time.
-    """
+    """Top results for a query, without resolving a stream URL yet."""
     query = query.strip()
     if not query:
         raise ValueError("empty query")
@@ -893,9 +796,9 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     if reason:
         raise ValueError(reason)
 
-    # Same order as /play, so the picker shows what pressing Enter would do:
-    # Same order as /play, so the picker shows what pressing Enter would do:
-    # JioSaavn (320k), then SoundCloud (128k), and only then YouTube.
+
+
+
     results = []
     try:
         results = search_jiosaavn(query, limit)
@@ -916,8 +819,8 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     if not results:
         options = dict(YDL_OPTIONS)
         options["extract_flat"] = "in_playlist"
-        # /play sets this to keep playlist links short, but on a ytsearch it
-        # would cap the whole result list at one - which defeats a picker.
+
+
         options.pop("playlist_items", None)
         try:
             with YoutubeDL(options) as ydl:
@@ -929,7 +832,7 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
                 if not url:
                     continue
                 if not is_url(url):
-                    # flat YouTube entries hand back just the video id
+
                     url = f"https://www.youtube.com/watch?v={url}"
                 results.append(
                     {
@@ -949,8 +852,7 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 
 def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
-    """The card posted whenever a song starts - used by commands and by the
-    playback loop itself, so every song gets the same treatment."""
+    """The card posted whenever a song starts - used by commands and by the playback loop itself, so every song gets the same treatment."""
     status = "Paused" if player.is_paused else "Playing"
     embed = discord.Embed(
         title=f"Audira {status}",
@@ -960,7 +862,7 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
     source = "stream" if track.is_stream else "local file"
     embed.add_field(
         name="Details",
-        value=f"{source} · {track.duration_label()}",
+        value=f"{source} ┬╖ {track.duration_label()}",
         inline=True,
     )
     if track.artist:
@@ -985,7 +887,7 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
     if player.autoplay:
         flags.append("autoplay")
     if flags:
-        embed.add_field(name="Modes", value=" · ".join(flags), inline=True)
+        embed.add_field(name="Modes", value=" ┬╖ ".join(flags), inline=True)
 
     if track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
@@ -1001,10 +903,7 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
 
 
 class MusicPlayer:
-    """Plays a queue of local files in one voice channel.
-
-    One of these exists per guild while CASE is connected.
-    """
+    """Plays a queue of local files in one voice channel. One of these exists per guild while CASE is connected."""
 
     def __init__(self, voice: discord.VoiceProtocol):
         self.voice = voice
@@ -1012,22 +911,22 @@ class MusicPlayer:
         self.current: Track | None = None
         self.notify_channel: discord.abc.Messageable | None = None
         self._task: asyncio.Task | None = None
-        # "off" repeats nothing, "song" replays the current track, "queue"
-        # pushes a finished track back onto the end of the queue.
+
+
         self.loop_mode = "off"
         self.autoplay = False
-        # Monotonic timestamp of when the current track actually started, so
-        # /nowplaying can draw a progress bar.
+
+
         self.started_at: float | None = None
-        # Set by /seek, cleared by the playback loop so the same track is
-        # queued again instead of moving on.
+
+
         self._seek_pending = False
-        # The temporary cut /seek made, swapped in when the loop sees the
-        # pending flag.
+
+
         self._seek_replacement: Track | None = None
-        # Makes /skip ignore song-loop for one round so skip still advances.
+
         self._skip_once = False
-        # Last few titles, used by autoplay to avoid instantly repeating.
+
         self._recent: list[str] = []
 
     @property
@@ -1090,12 +989,7 @@ class MusicPlayer:
         return max(0, int(time.monotonic() - self.started_at))
 
     async def seek(self, seconds: int) -> bool:
-        """Restart the current track at `seconds`.
-
-        Cuts a temporary file copy of the audio in a thread while the song
-        keeps playing, then swaps it in - so the seek never depends on a CDN
-        answering a remote byte-range request.
-        """
+        """Restart the current track at `seconds`."""
         if self.current is None or not self.voice.is_connected():
             return False
         clip = await asyncio.to_thread(_cut_track, self.current, max(0, seconds))
@@ -1103,7 +997,7 @@ class MusicPlayer:
             return False
         self._seek_pending = True
         self._seek_replacement = clip
-        # Stopping makes _play_one return, and the loop re-queues the clip.
+
         self.voice.stop()
         return True
 
@@ -1118,8 +1012,8 @@ class MusicPlayer:
                 track = self.queue.pop(0)
                 ok = await self._play_one(track)
 
-                # /seek stopped this track on purpose - swap in the cut
-                # portion and play on from the new position.
+
+
                 if self._seek_pending:
                     self._seek_pending = False
                     track = self._seek_replacement or track
@@ -1128,9 +1022,9 @@ class MusicPlayer:
                     continue
 
                 if not ok and track.is_stream and self.voice.is_connected():
-                    # The stream URL had likely gone stale (YouTube answers 403
-                    # once a link ages or gets reused). Resolve it again and
-                    # try once more before telling the user it failed.
+
+
+
                     log.info("retrying %s with a fresh stream URL", track.title)
                     try:
                         fresh = await asyncio.to_thread(
@@ -1145,8 +1039,8 @@ class MusicPlayer:
                 if ok:
                     self._apply_loop(track)
 
-                # Autoplay runs after a skip too, so /skip on the last song
-                # keeps the music going instead of winding down.
+
+
                 if not self.queue and self.autoplay:
                     await self._queue_autoplay(track)
 
@@ -1155,41 +1049,37 @@ class MusicPlayer:
         except asyncio.CancelledError:
             pass
         except Exception:
-            # Anything unexpected must not take the whole playback loop down
-            # silently - the queue would sit there with nothing happening.
+
+
             log.exception("playback loop stopped on an unexpected error")
         finally:
             self.current = None
-            # Stay in the channel when the queue runs dry - only /stop (or
-            # someone kicking us out) ends the session.
+
+
             if self.voice.is_connected() and not self.queue:
                 log.info("queue finished - staying in the voice channel")
 
     async def _play_one(self, track: Track) -> bool:
-        """Start one track and wait for it to finish.
-
-        Returns True when FFmpeg ran to the end (or was skipped), False when
-        the source died early - that's when a retry is worth attempting.
-        """
+        """Start one track and wait for it to finish."""
         self.current = track
         log.info("playing %s", track.title)
 
         before_options = ""
         if track.is_stream:
-            # Only networks need the reconnect flags - FFmpeg rejects them for
-            # local files (that includes the temporary /seek cut), so clips
-            # stay on the plain-path branch.
+
+
+
             before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
             if not track.temp_path and track.headers:
-                # FFmpeg's default UA gets rejected by most CDNs, so replay
-                # the exact headers yt-dlp said go with this stream.
+
+
                 pairs = [f"{key}: {value}" for key, value in track.headers.items()]
                 header_blob = "\r\n".join(pairs) + "\r\n"
                 before_options += " -headers " + shlex.quote(header_blob)
 
         try:
-            # FFmpegOpusAudio reads a local path or pulls a URL -
-            # both end up as Opus frames, so playback doesn't care.
+
+
             source = discord.FFmpegOpusAudio(
                 track.source,
                 executable=find_ffmpeg(),
@@ -1205,22 +1095,22 @@ class MusicPlayer:
         try:
             self.voice.play(source, after=errors.append)
         except discord.ClientException as exc:
-            # voice dropped between the check in _run and now
+
             log.warning("voice.play failed: %s", exc)
             self.current = None
             return False
 
-        # The queue advances on its own after a skip or an autoplay pick, so
-        # this is where most songs get their card posted.
+
+
         self._announce(track)
 
-        # poll until the track ends, a skip happens, or stop() cancels us
+
         self.started_at = time.monotonic()
         while self.voice.is_playing() or self.voice.is_paused():
             await asyncio.sleep(0.5)
 
-        # discord.py hands the after-callback its error a tick after playback
-        # stops, so give it a moment before we look.
+
+
         await asyncio.sleep(0.2)
         self.started_at = None
 
@@ -1228,7 +1118,7 @@ class MusicPlayer:
         if error is not None:
             log.warning("playback of %s ended early: %s", track.title, error)
         else:
-            # It actually played, so it is worth remembering.
+
             await db.log_play(
                 self.voice.guild.id,
                 track.title,
@@ -1239,8 +1129,8 @@ class MusicPlayer:
             )
 
         self.current = None
-        # The cut file is only good for this one play-through - throw it away
-        # unless song/queue loop wants to replay it.
+
+
         if track.temp_path and self.loop_mode == "off":
             track.cleanup()
         return error is None
@@ -1252,16 +1142,12 @@ class MusicPlayer:
         elif self.loop_mode == "queue":
             self.queue.append(track)
         if self._skip_once:
-            # /skip must move forward even with song-loop on, so ignore the
-            # loop exactly once instead of trapping the user in a replay.
+
+
             self._skip_once = False
 
     async def _first_playable(self, candidates: list[dict], finished: Track) -> Track | None:
-        """First candidate that resolves and isn't a song we already played.
-
-        Compared on autoplay keys, so any edition of "Hale Dil" - acoustic,
-        remix, another artist's upload - counts as "Hale Dil" itself.
-        """
+        """First candidate that resolves and isn't a song we already played."""
         played = set(self._recent)
         finished_key = _autoplay_key(finished.title)
         for candidate in candidates:
@@ -1288,12 +1174,7 @@ class MusicPlayer:
         return None
 
     async def _queue_autoplay(self, finished: Track) -> None:
-        """Keep the music going with something similar when the queue runs dry.
-
-        Autoplay looks for tracks like the one that just ended and skips
-        anything already played recently, so it doesn't loop the same few
-        songs. It also stops if the bot is left alone in the channel.
-        """
+        """Keep the music going with something similar when the queue runs dry."""
         if not self.voice.is_connected():
             return
         channel = self.voice.channel
@@ -1304,16 +1185,16 @@ class MusicPlayer:
         self._recent.append(_autoplay_key(finished.title))
         self._recent = self._recent[-15:]
 
-        # Artist first (keeps the next pick in the same style), then the
-        # title - one of them usually works when the other doesn't.
+
+
         queries = [q for q in (finished.artist, finished.title) if q]
         log.info("autoplay: looking for something like %r", finished.title)
 
         track = None
 
-        # JioSaavn first: it answers in about a second while YouTube can sit
-        # there for a minute when it doesn't like our IP. Its search is loose
-        # though, so results have to actually relate to what we asked for.
+
+
+
         for query in queries:
             try:
                 candidates = await asyncio.wait_for(
@@ -1336,8 +1217,8 @@ class MusicPlayer:
             if track:
                 break
 
-        # Slower fallback - YouTube search (with JioSaavn inside it) covers
-        # songs the Indian catalog doesn't have.
+
+
         for query in queries:
             if track:
                 break
@@ -1376,12 +1257,7 @@ class MusicPlayer:
             asyncio.create_task(self.notify_channel.send(message))
 
     def _announce(self, track: Track) -> None:
-        """Post the now-playing card when a song starts on its own.
-
-        Commands already post it when they start a song directly, which is
-        what `track.announced` marks - everything else (queue advancing,
-        /skip, autoplay) gets the card from here.
-        """
+        """Post the now-playing card when a song starts on its own."""
         if track.announced:
             track.announced = False
             return
@@ -1399,11 +1275,7 @@ class MusicPlayer:
 
 
 class SearchPicker(discord.ui.View):
-    """A dropdown of search results that queues whichever one is picked.
-
-    Search and the actual resolve are kept apart on purpose: resolving pins a
-    stream URL that expires, and a human picking from a list can take a while.
-    """
+    """A dropdown of search results that queues whichever one is picked."""
 
     def __init__(self, cog: "Music", results: list[dict]):
         super().__init__(timeout=60)
@@ -1469,19 +1341,15 @@ class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.players: dict[int, MusicPlayer] = {}
-        # Autoplay choice lives on the cog too, so it survives a player being
-        # thrown away (queue ended, bot restarted) instead of resetting.
+
+
         self.default_autoplay = False
 
     def get_player(self, guild: discord.Guild) -> MusicPlayer | None:
         return self.players.get(guild.id)
 
     async def ensure_player(self, interaction: discord.Interaction) -> tuple[MusicPlayer | None, str | None]:
-        """Make sure CASE is connected to the user's channel and ready to play.
-
-        Returns (player, error). On error the player is None and the caller
-        decides how to reply - defer() may already have been sent by then.
-        """
+        """Make sure CASE is connected to the user's channel and ready to play."""
         member = interaction.user.voice
         if member is None:
             return None, "You're not in a voice channel."
@@ -1491,8 +1359,8 @@ class Music(commands.Cog):
 
         voice = interaction.guild.voice_client
 
-        # A timed-out or dropped handshake leaves a client object that is not
-        # connected. It blocks reconnects, so throw it away first.
+
+
         if voice is not None and not voice.is_connected():
             try:
                 await voice.disconnect(force=True)
@@ -1524,7 +1392,7 @@ class Music(commands.Cog):
             player.autoplay = self.default_autoplay
             self.players[interaction.guild.id] = player
         else:
-            # reconnecting after a drop - point the player at the live client
+
             player.voice = voice
 
         return player, None
@@ -1567,16 +1435,16 @@ class Music(commands.Cog):
         song="Song name, a YouTube/SoundCloud link, or a file in music/"
     )
     async def play(self, interaction: discord.Interaction, song: str):
-        # Resolving a stream can take a few seconds, so acknowledge immediately.
-        # Not ephemeral: everyone should see what got queued (and any error).
+
+
         await interaction.response.defer()
         log.info("play: resolving %r", song)
         started = time.monotonic()
 
         try:
-            # yt-dlp is blocking, so keep it off the event loop. The timeout
-            # stops a slow site from leaving the command at "thinking" forever.
-            # It has to cover every player-client fallback attempt.
+
+
+
             track = await asyncio.wait_for(
                 asyncio.to_thread(resolve_track, song, interaction.user.display_name),
                 timeout=100,
@@ -1588,12 +1456,12 @@ class Music(commands.Cog):
             )
             return
         except ValueError as exc:
-            # our own message (unsupported link, bad query) - show it as-is
+
             log.warning("rejected %r: %s", song, exc)
             await interaction.followup.send(str(exc))
             return
         except (DownloadError, LookupError) as exc:
-            # yt-dlp failures are expected, not crashes - one line, no traceback
+
             log.warning("could not resolve %r: %s", song, exc)
             await interaction.followup.send(
                 f"I couldn't find anything for **{song}**.\nReason: `{reason_line(exc)}`"
@@ -1608,10 +1476,7 @@ class Music(commands.Cog):
     async def _queue_track(
         self, interaction: discord.Interaction, track: Track, label: str
     ) -> None:
-        """Connect, queue `track`, and reply. Caller must have deferred.
-
-        Shared by /play and /search so both behave identically.
-        """
+        """Connect, queue `track`, and reply. Caller must have deferred. Shared by /play and /search so both behave identically."""
         try:
             player, error = await asyncio.wait_for(
                 self.ensure_player(interaction), timeout=40
@@ -1631,8 +1496,8 @@ class Music(commands.Cog):
         was_idle = player.is_idle()
         player.notify_channel = interaction.channel
         if was_idle:
-            # This reply carries the now-playing card, so the playback loop
-            # won't post a second one for the same track.
+
+
             track.announced = True
         player.add(track)
 
@@ -1642,7 +1507,7 @@ class Music(commands.Cog):
             )
         else:
             await interaction.followup.send(
-                f"Added **{track.title}** to the queue — position {len(player.queue)}."
+                f"Added **{track.title}** to the queue ΓÇö position {len(player.queue)}."
             )
         log.info("play: reply sent")
 
@@ -1652,7 +1517,7 @@ class Music(commands.Cog):
         if player is None or player.current is None:
             await interaction.response.send_message("Nothing is playing right now.")
             return
-        # is_playing() is False while paused, so check paused first.
+
         if player.is_paused:
             await interaction.response.send_message("The music is already paused.")
             return
@@ -1681,8 +1546,8 @@ class Music(commands.Cog):
             await interaction.response.send_message("Nothing is playing right now.")
             return
 
-        # Skip only moves on - staying in the channel is handled by the
-        # playback loop, and leaving is /stop's job alone.
+
+
         if player.queue:
             nxt = player.queue[0].title
             player.skip()
@@ -1806,7 +1671,7 @@ class Music(commands.Cog):
         embed = discord.Embed(title="Audira Queue", colour=discord.Colour.blurple())
         embed.add_field(
             name="Now Playing",
-            value=player.current.title if player.current else "—",
+            value=player.current.title if player.current else "ΓÇö",
             inline=False,
         )
 
@@ -1864,7 +1729,7 @@ class Music(commands.Cog):
     async def search(self, interaction: discord.Interaction, query: str):
         await interaction.response.defer(ephemeral=True)
 
-        # An exact local match is unambiguous, so don't make them pick it.
+
         path = find_song(query)
         if path is not None:
             await interaction.followup.send(
@@ -1911,16 +1776,16 @@ class Music(commands.Cog):
             title = player.current.title
 
         if player is not None and player.current is not None:
-            # When the query is the song on right now, use its metadata too so
-            # duration and artist can rule out look-alike tracks.
+
+
             if _lyrics_key(title) == _lyrics_key(player.current.title):
                 artist = player.current.artist
                 duration = player.current.duration
 
         await interaction.response.defer()
 
-        # YouTube titles carry junk like "| Artist" and "(Official Video)".
-        # lrclib matches better on a trimmed version, so try both.
+
+
         trimmed = re.split(r"\s+\|\s+|\s+-\s+", title)[0].strip()
         attempts = [title]
         if trimmed and trimmed.lower() != title.lower():
@@ -1940,8 +1805,8 @@ class Music(commands.Cog):
 
         text = item["plainLyrics"].strip()
         if len(text) > 3900:
-            # Discord cuts embeds off at 4096, leave room for the title.
-            text = text[:3900].rsplit("\n", 1)[0] + "\n…"
+
+            text = text[:3900].rsplit("\n", 1)[0] + "\nΓÇª"
 
         embed = discord.Embed(
             title=item.get("trackName") or trimmed or query,
@@ -1958,7 +1823,7 @@ class Music(commands.Cog):
     async def autoplay(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild)
         if player is None:
-            # No session running yet - remember the choice for the next one.
+
             self.default_autoplay = not self.default_autoplay
             if self.default_autoplay:
                 await interaction.response.send_message(
@@ -1995,7 +1860,7 @@ class Music(commands.Cog):
         lines = []
         for row in rows:
             stamp = row["played_at"].astimezone().strftime("%d %b %H:%M")
-            lines.append(f"`{stamp}` **{row['title']}** — {row['requested_by']}")
+            lines.append(f"`{stamp}` **{row['title']}** ΓÇö {row['requested_by']}")
 
         embed = discord.Embed(
             title="Recently Played",
@@ -2009,8 +1874,8 @@ class Music(commands.Cog):
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-        # CASE got disconnected by someone (or Discord dropped us).
-        # Clean up so the next /play starts fresh.
+
+
         if member.id == self.bot.user.id and after.channel is None:
             player = self.players.get(member.guild.id)
             if player:
