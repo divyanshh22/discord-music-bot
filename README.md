@@ -11,6 +11,8 @@ no cloud anything.
 
 - Join and leave voice channels
 - Play local audio files from the `music/` folder
+- Songs from the internet: **JioSaavn** for plain queries (about 2s, no
+  account, no bot check) and **YouTube** through yt-dlp for links
 - Pause, resume, skip and stop
 - Per-server queue with automatic advance to the next song
 - `/queue` and `/nowplaying` displays
@@ -191,8 +193,11 @@ itself comes from `requirements.txt`; the token generator is a node.js app
 that the build clones and compiles into `potprovider/`:
 
 ```bash
-pip install -r requirements.txt && (test -d potprovider || git clone --depth 1 --single-branch --branch 2.0.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git potprovider) && cd potprovider/server && npm ci && npx tsc
+pip install -r requirements.txt && rm -rf potprovider && git clone --depth 1 --single-branch --branch 2.0.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git potprovider && cd potprovider/server && (npm ci || npm install) && npx tsc
 ```
+
+The `rm -rf` matters: Render's build cache kept a `potprovider/` without its
+`package-lock.json`, and `npm ci` refuses to run without one.
 
 Paste that as the service's **Build Command** (Settings → Build & Deploy).
 CASE runs fine without it - it just cannot play from a flagged IP.
