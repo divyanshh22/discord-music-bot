@@ -141,12 +141,40 @@ def parse_timestamp(text: str) -> int:
     return seconds
 
 
-def progress_bar(elapsed: int, total: int, width: int = 20) -> str:
-    """A compact slider like `████░░░░░░░░░░░░░░░░░` for embeds."""
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_EQ_WAVE = "▁▂▃▄▅▆▇█▇▆▅▄▃"
+
+
+def _frame() -> int:
+    """One animation tick per second (the card re-renders every second)."""
+    return int(time.time())
+
+
+def spin_indicator(paused: bool = False) -> str:
+    """Animated spinner while playing, a calm dot when paused."""
+    if paused:
+        return "⏸"
+    return _SPINNER_FRAMES[_frame() % len(_SPINNER_FRAMES)]
+
+
+def equalizer(active: bool = True) -> str:
+    """A tiny dancing-equalizer glyph strip for the card."""
+    phase = _frame()
+    if not active:
+        return "▁" * 6
+    return "".join(_EQ_WAVE[(phase + i * 3) % len(_EQ_WAVE)] for i in range(6))
+
+
+def progress_bar(elapsed: int, total: int, width: int = 24) -> str:
+    """A slim slider `▰▰▰▰▱▱▱▱` with a shimmering head that drifts along."""
     if not total:
-        return "░" * width
+        return "▱" * width
     filled = max(0, min(width, round(width * elapsed / total)))
-    return "█" * filled + "░" * (width - filled)
+    bar = ["▰"] * filled + ["▱"] * (width - filled)
+    pos = _frame() % width
+    if filled < width and pos >= filled:
+        bar[pos] = "▫"
+    return "".join(bar)
 
 
 def short_duration(seconds: int | None) -> str:
@@ -988,19 +1016,25 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 
 def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
-    """Modern now-playing card with better readability and audio quality details."""
-    status = "Paused" if player.is_paused else "Playing"
+    """A classy, subtly animated now-playing card (spinner + equalizer + shimmer)."""
+    paused = player.is_paused
+    status = "Paused" if paused else "Now Playing"
     quality = track.quality or ("320k" if track.is_stream else "local")
-    source = "🎵 YouTube" if "youtube" in (track.webpage_url or "").lower() else (
-        "🎧 JioSaavn" if "jiosaavn" in (track.webpage_url or "").lower() else (
-            "📁 local file" if not track.is_stream else "🎶 stream"
+    source = "YouTube" if "youtube" in (track.webpage_url or "").lower() else (
+        "JioSaavn" if "jiosaavn" in (track.webpage_url or "").lower() else (
+            "local file" if not track.is_stream else "stream"
         )
     )
 
+    description = f"**{track.title}**"
+    if track.artist:
+        description += f"\n*{track.artist}*"
+    description += "\n`─────────────────────`"
+
     embed = discord.Embed(
-        title=f"Audira • {status}",
-        description=f"**{track.title}**\n*{track.artist}*" if track.artist else f"**{track.title}**",
-        colour=discord.Colour.from_rgb(103, 110, 255),
+        title=f"{spin_indicator(paused)}  {status}",
+        description=description,
+        colour=discord.Colour.from_rgb(99, 102, 241),
         timestamp=datetime.now(timezone.utc),
     )
     embed.set_author(name="Audira", icon_url="https://cdn-icons-png.flaticon.com/512/2361/2361845.png")
@@ -1011,28 +1045,20 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
 
     left = track.duration_label() if track.duration else "live"
     progress = "—"
+    playback_value = equalizer(not paused)
     if track.duration:
         elapsed = min(player.elapsed(), track.duration)
         pct = round(elapsed / track.duration * 100) if track.duration else 0
-        progress = f"{elapsed // 60}:{elapsed % 60:02d} / {left} • {pct}%"
-
-    embed.add_field(name="▶ Source", value=f"{source}", inline=True)
-    embed.add_field(name="🎧 Quality", value=f"{quality}", inline=True)
-    embed.add_field(name="👤 Requested by", value=track.requested_by, inline=True)
-    embed.add_field(name="⏱ Progress", value=f"{progress}", inline=False)
-
-    if track.duration:
-        elapsed = min(player.elapsed(), track.duration)
-        pct = round(elapsed / track.duration * 100) if track.duration else 0
-        embed.add_field(
-            name="⏳ Playback",
-            value=(
-                f"`{elapsed // 60}:{elapsed % 60:02d}` "
-                f"{progress_bar(elapsed, track.duration)} "
-                f"`{pct}%`"
-            ),
-            inline=False,
+        progress = f"{elapsed // 60}:{elapsed % 60:02d} / {left}"
+        playback_value = (
+            f"`{progress}`\n"
+            f"{progress_bar(elapsed, track.duration)}  `{pct}%`  {equalizer(not paused)}"
         )
+
+    embed.add_field(name="Playback", value=playback_value, inline=False)
+    embed.add_field(name="Source", value=source, inline=True)
+    embed.add_field(name="Quality", value=quality, inline=True)
+    embed.add_field(name="Requested by", value=track.requested_by, inline=True)
 
     flags = []
     if player.loop_mode != "off":
@@ -1040,13 +1066,18 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
     if player.autoplay:
         flags.append("autoplay")
     if flags:
-        embed.add_field(name="⚙ Modes", value=" | ".join(flags), inline=False)
+        embed.add_field(name="Modes", value=" · ".join(flags), inline=True)
 
     if player.queue:
-        next_titles = ", ".join(t.title for t in player.queue[:3])
-        embed.add_field(name=f"🎶 Up next ({len(player.queue)})", value=next_titles, inline=False)
+        next_titles = "\n".join(
+            f"`{i}.` {t.title}" for i, t in enumerate(player.queue[:3], start=1)
+        )
+        embed.add_field(name=f"Up Next — {len(player.queue)} queued", value=next_titles, inline=False)
 
-    embed.set_footer(text="Audira • premium music card", icon_url="https://cdn-icons-png.flaticon.com/512/2361/2361845.png")
+    embed.set_footer(
+        text=f"Audira  ·  {equalizer(not paused)}  ·  premium stream",
+        icon_url="https://cdn-icons-png.flaticon.com/512/2361/2361845.png",
+    )
     return embed
 
 
