@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+import urllib.parse
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
@@ -25,6 +26,22 @@ import config
 import db
 
 log = logging.getLogger("case")
+
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+INVIDIOUS_INSTANCES = [
+    "https://invidious.fdn.fr",
+    "https://invidious.privacydev.net",
+    "https://iv.melmac.space",
+    "https://invidious.slipfox.xyz",
+]
 
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".ogg", ".m4a", ".flac")
 
@@ -602,6 +619,22 @@ def search_jiosaavn(query: str, limit: int = MAX_RESULTS) -> list[dict]:
             }
         )
     return results
+
+
+def _ua() -> str:
+    return random.choice(USER_AGENTS)
+
+
+def _with_ua(extra: dict | None = None) -> dict:
+    base = dict(YDL_OPTIONS)
+    base["http_headers"] = {"User-Agent": _ua(), "Accept-Language": "en-US,en;q=0.9"}
+    if extra:
+        base.update(extra)
+    return base
+
+
+def _merge_options(extra: dict | None = None) -> dict:
+    return _with_ua(extra)
 
 
 def _jiosaavn_info(query: str) -> dict | None:
