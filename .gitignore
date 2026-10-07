@@ -4,6 +4,8 @@ venv/
 
 # secrets - never commit this file
 .env
+youtube-cookies*.txt
+ytbot-cookies*.txt
 
 # python
 __pycache__/

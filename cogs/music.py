@@ -550,7 +550,6 @@ YDL_OPTIONS = {
     "quiet": True,
     "no_warnings": True,
     "nocheckcertificate": True,
-    "default_search": "ytsearch1",
     "thumbnail": True,
     "retries": 1,
     "fragment_retries": 1,
@@ -559,15 +558,6 @@ YDL_OPTIONS = {
 }
 
 
-
-
-_YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIES_FILE")
-if _YOUTUBE_COOKIE_FILE:
-    if Path(_YOUTUBE_COOKIE_FILE).is_file():
-        YDL_OPTIONS["cookiefile"] = _YOUTUBE_COOKIE_FILE
-        log.info("YouTube cookies enabled from configured secret file")
-    else:
-        log.warning("YOUTUBE_COOKIES_FILE is set but the file does not exist")
 
 
 _NODE = find_node()
@@ -652,19 +642,17 @@ def _merge_options(extra: dict) -> dict:
 
 
 def _extract_once(options: dict, query: str) -> dict | None:
-    """One yt-dlp extraction - search first, then the full video details."""
+    """Extract one direct JioSaavn URL; text search is handled by the Saavn API."""
+    if not is_url(query):
+        raise ValueError("Only direct JioSaavn links can be extracted")
+    host = urlparse(query).netloc.lower().split(":")[0].removeprefix("www.")
+    if host != "jiosaavn.com" and not host.endswith(".jiosaavn.com"):
+        raise ValueError("Only JioSaavn links can be extracted")
+
     with YoutubeDL(options) as ydl:
-        _boost_pot_provider()
-        if is_url(query):
-            info = ydl.extract_info(query, download=False)
-            if not info:
-                raise LookupError("couldn't read that link")
-        else:
-            info = ydl.extract_info(f"ytsearch:{MAX_RESULTS}:{query}", download=False)
-            entries = [e for e in (info or {}).get("entries", []) if e]
-            if not entries:
-                raise LookupError("no results")
-            info = ydl.process_ie_result(entries[0], download=False)
+        info = ydl.extract_info(query, download=False)
+        if not info:
+            raise LookupError("couldn't read that JioSaavn link")
 
         if not info:
             raise LookupError("no results")
@@ -927,7 +915,7 @@ async def _invidious_info(query: str) -> tuple[dict | None, Exception | None]:
 
 
 async def resolve_track(query: str, requested_by: str) -> Track:
-    """Turn a /play argument into a Track."""
+    """Resolve local files or JioSaavn tracks; never stream from other platforms."""
     query = query.strip()
     if not query:
         raise ValueError("empty query")
@@ -942,47 +930,40 @@ async def resolve_track(query: str, requested_by: str) -> Track:
 
     if is_url(query):
         host = urlparse(query).netloc.lower().split(":")[0].replace("www.", "")
-        if "youtube" in host or host in {"youtu.be", "m.youtube.com", "music.youtube.com"}:
-            info, last_error = await _youtube_info(query)
-            if info is None:
-                if last_error is None:
-                    raise LookupError("no results")
-                raise last_error
-            return _build_track(info, query, requested_by)
-
-        jsaavn_info = await asyncio.to_thread(_jiosaavn_info_for_url, query)
-        if jsaavn_info:
-            try:
-                return _build_track(jsaavn_info, query, requested_by)
-            except LookupError:
-                log.warning("jiosaavn url fallback had no playable stream for %r", query)
-        raise LookupError("no results")
+        if host != "jiosaavn.com" and not host.endswith(".jiosaavn.com"):
+            raise ValueError(
+                "Audira plays from JioSaavn only. Search by song name or paste a JioSaavn link."
+            )
+        try:
+            info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, query)
+        except Exception as exc:
+            raise LookupError(reason_line(exc)) from exc
+        if not info:
+            raise LookupError("JioSaavn returned no playable track")
+        return _build_track(info, query, requested_by)
 
     last_error: Exception | None = None
     try:
         candidates = await asyncio.wait_for(
             asyncio.to_thread(search_candidates, query, MAX_RESULTS),
-            timeout=45,
+            timeout=30,
         )
     except asyncio.TimeoutError as exc:
-        last_error = LookupError("YouTube search timed out after 45 seconds")
-        log.warning("youtube search timed out for %r", query)
+        raise LookupError("JioSaavn search timed out after 30 seconds") from exc
     except Exception as exc:
-        last_error = exc
-        log.warning("youtube search failed for %r: %s", query, reason_line(exc))
+        raise LookupError(reason_line(exc)) from exc
 
-    if last_error is None:
-        for candidate in candidates:
-            url = candidate.get("webpage_url")
-            if not url:
-                continue
-            try:
-                info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, url)
-                if info:
-                    return _build_track(info, query, requested_by)
-            except Exception as exc:
-                last_error = exc
-                log.warning("candidate resolve failed for %r: %s", url, reason_line(exc))
+    for candidate in candidates:
+        url = candidate.get("webpage_url")
+        if not url:
+            continue
+        try:
+            info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, url)
+            if info:
+                return _build_track(info, query, requested_by)
+        except Exception as exc:
+            last_error = exc
+            log.warning("JioSaavn candidate resolve failed for %r: %s", url, reason_line(exc))
 
     if last_error is not None:
         raise LookupError(reason_line(last_error)) from last_error
@@ -990,52 +971,19 @@ async def resolve_track(query: str, requested_by: str) -> Track:
 
 
 def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
-    """Top YouTube Music/YouTube results for a query, without resolving a stream URL yet."""
+    """Search JioSaavn and return selectable song results."""
     query = query.strip()
     if not query:
         raise ValueError("empty query")
 
-    reason = unsupported_reason(query)
-    if reason:
-        raise ValueError(reason)
-
-    results = []
-    last_error: Exception | None = None
-    options = dict(YDL_OPTIONS)
-    options["extract_flat"] = "in_playlist"
-    options.pop("playlist_items", None)
-
-    for source_query in (f"ytmsearch{limit}:{query}", f"ytsearch{limit}:{query}"):
-        try:
-            with YoutubeDL(options) as ydl:
-                info = ydl.extract_info(source_query, download=False)
-            entries = [e for e in (info or {}).get("entries", []) if e]
-        except Exception as exc:
-            last_error = exc
-            log.warning("youtube search failed for %s: %s", source_query, reason_line(exc))
-            continue
-
-        for entry in entries:
-            url = entry.get("webpage_url") or entry.get("url")
-            if not url:
-                continue
-            if not is_url(url):
-                url = f"https://www.youtube.com/watch?v={url}"
-            results.append(
-                {
-                    "title": entry.get("title") or query,
-                    "webpage_url": url,
-                    "duration": int(entry.get("duration") or 0) or None,
-                }
-            )
-        if results:
-            log.info("youtube search: %d result(s)", len(results))
-            break
-
+    try:
+        results = search_jiosaavn(query, limit=limit)
+    except Exception as exc:
+        log.warning("JioSaavn search failed for %r: %s", query, reason_line(exc))
+        raise LookupError(reason_line(exc)) from exc
     if not results:
-        if last_error is not None:
-            raise LookupError(reason_line(last_error)) from last_error
         raise LookupError("no results")
+    log.info("JioSaavn search: %d result(s)", len(results))
     return results
 
 
@@ -1673,7 +1621,7 @@ class Music(commands.Cog):
 
     @discord.app_commands.command(name="play", description="Play a song by name, link, or from music/.")
     @discord.app_commands.describe(
-        song="Song name, a YouTube/YouTube Music/Spotify link, or a file in music/"
+        song="Song name, JioSaavn link, or a file in music/"
     )
     async def play(self, interaction: discord.Interaction, song: str):
 

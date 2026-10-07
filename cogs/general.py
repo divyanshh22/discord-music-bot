@@ -61,7 +61,7 @@ class General(commands.Cog):
             inline=False,
         )
         embed.set_footer(
-            text="/play searches YouTube, YouTube Music, and SoundCloud, or plays a matching file from music/."
+            text="/play searches JioSaavn or plays a matching file from music/."
         )
         await interaction.response.send_message(embed=embed)
 

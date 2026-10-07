@@ -1,9 +1,7 @@
 # Audira
 
 A personal Discord music bot: one command plays a song in your voice channel.
-It plays matching files from `music/`, and for anything else it searches
-**YouTube** and **YouTube Music** first, then **SoundCloud** — which is also
-what a pasted link uses.
+It plays matching files from `music/` or searches **JioSaavn** for a song.
 
 Built for my own private server.
 
@@ -11,10 +9,7 @@ Built for my own private server.
 
 - Join and leave voice channels
 - Play local audio files from the `music/` folder
-- Songs from the internet: **YouTube** and **YouTube Music** through yt-dlp
-  (with a po-token provider, so data-centre playback does not get "sign in to
-  confirm you're not a bot"), then **SoundCloud**
-  - which is what a pasted YouTube or SoundCloud link uses
+- Songs from JioSaavn through yt-dlp
 - Pause, resume, skip and stop
 - Per-server queue with automatic advance to the next song
 - `/queue` and `/nowplaying` displays
@@ -180,43 +175,18 @@ music/
 4. Paste the build command below in **Settings → Build & Deploy**.
 5. Deploy. Render's health check passes because Audira listens on `$PORT`.
 
-### The PO-token provider
+### Render build
 
-YouTube challenges data-centre IPs (Render, a VPS) with *"Sign in to confirm
-you're not a bot"*, and yt-dlp cannot answer that on its own.
-`bgutil-ytdlp-pot-provider` supplies the proof-of-origin token. The plugin
-itself comes from `requirements.txt`; the token generator is a node.js app.
-Render's Python runtime has no node.js by default, so the build also bakes a
-node binary into the repo (at `node/bin/node`) that the bot finds at runtime.
-The whole setup lives in `render-build.sh` - the Build Command is just:
+JioSaavn playback does not require YouTube cookies, a PO-token provider, or
+Node.js. The build command is:
 
 ```bash
 bash render-build.sh
 ```
 
-The `rm -rf` matters: Render's build cache kept a `potprovider/` without its
-`package-lock.json`, and `npm ci` refuses to run without one.
-
 Put `bash render-build.sh` as the service's **Build Command** (Settings →
-Build & Deploy). After a deploy, `bot.py` logs
-`po-token provider: .../potprovider/server`. Without it, or without node,
-YouTube links fail with *"Sign in to confirm you're not a bot"* from a
-flagged IP.
-
-### YouTube cookies (optional but strongest)
-
-Data-centre rotation occasionally defeats PO-token generation too. The
-reliable fallback is the bot's own YouTube session: export a
-**Netscape-format** cookies file (e.g. with the *Get cookies.txt LOCALLY*
-extension), read it into a base64 string and set it as a `YOUTUBE_COOKIES`
-env var (`DEFAULT_SEARCH` still works without it):
-
-```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\path\to\cookies.txt"))
-```
-
-`YOUTUBE_COOKIES` accepts either that base64 blob or a file path, and can
-also live in `.env` for local runs.
+Build & Deploy). Audira searches JioSaavn; YouTube links are not used as audio
+sources.
 
 Free-tier caveats: the web service spins down after ~15 min of no HTTP
 traffic, and the free Postgres database expires after 30 days.
