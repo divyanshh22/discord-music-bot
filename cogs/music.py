@@ -336,6 +336,87 @@ UNSUPPORTED_DOMAINS = {
     ),
 }
 
+JIOSAAVN_API = "https://www.jiosaavn.com/api.php"
+
+
+def search_jiosaavn(query: str, limit: int = MAX_RESULTS) -> list[dict]:
+    """Exact-track results from JioSaavn for a single title or URL-derived song name."""
+    params = urlencode(
+        {
+            "_format": "json",
+            "_method": "get",
+            "_page": "1",
+            "p": "1",
+            "n": str(limit),
+            "q": query,
+            "result": "song",
+            "specific": "true",
+            "__call": "search.getResults",
+        }
+    )
+    request = urllib.request.Request(
+        f"{JIOSAAVN_API}?{params}",
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        data = json.load(response)
+
+    results = []
+    for item in (data.get("results") or [])[:limit]:
+        page = item.get("perma_url")
+        if not page:
+            continue
+        artist = (item.get("primary_artists") or item.get("music") or "").strip()
+        results.append(
+            {
+                "title": item.get("song") or query,
+                "webpage_url": page,
+                "duration": int(item.get("duration") or 0) or None,
+                "artist": artist or None,
+                "thumbnail": item.get("image") or None,
+            }
+        )
+    return results
+
+
+def _extract_title_from_url(url: str) -> str | None:
+    """Best-effort title extraction from a non-YouTube platform URL."""
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.netloc.lower().split(":")[0].replace("www.", "")
+        path = urllib.parse.unquote(parsed.path or "")
+        if netloc in {"spotify.com", "open.spotify.com"}:
+            parts = [p for p in path.split("/") if p]
+            if len(parts) >= 2:
+                slug = parts[-1]
+                return slug.replace("-", " ").strip()
+        if path:
+            slug = path.rstrip("/").split("/")[-1]
+            if slug:
+                return slug.replace("-", " ").replace("_", " ").strip()
+    except Exception:
+        pass
+    return None
+
+
+def _jiosaavn_info_for_url(url: str) -> dict | None:
+    """JioSaavn fallback only for exact URL-derived song names, not generic keyword search."""
+    host = urlparse(url).netloc.lower().split(":")[0].replace("www.", "")
+    if "youtube" in host or host in {"youtu.be", "m.youtube.com", "music.youtube.com"}:
+        return None
+    title = _extract_title_from_url(url)
+    if not title:
+        return None
+    try:
+        matches = search_jiosaavn(title, limit=1)
+        if not matches:
+            return None
+        page = matches[0]["webpage_url"]
+        return _extract_once(YDL_OPTIONS, page)
+    except Exception as exc:
+        log.warning("jiosaavn url fallback failed for %r: %s", url, reason_line(exc))
+        return None
+
 
 def unsupported_reason(text: str) -> str | None:
     """A chat-friendly explanation for links CASE can never play, else None."""
@@ -843,12 +924,22 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         return Track.from_file(path, requested_by)
 
     if is_url(query):
-        info, last_error = await _youtube_info(query)
-        if info is None:
-            if last_error is None:
-                raise LookupError("no results")
-            raise last_error
-        return _build_track(info, query, requested_by)
+        host = urlparse(query).netloc.lower().split(":")[0].replace("www.", "")
+        if "youtube" in host or host in {"youtu.be", "m.youtube.com", "music.youtube.com"}:
+            info, last_error = await _youtube_info(query)
+            if info is None:
+                if last_error is None:
+                    raise LookupError("no results")
+                raise last_error
+            return _build_track(info, query, requested_by)
+
+        jsaavn_info = await asyncio.to_thread(_jiosaavn_info_for_url, query)
+        if jsaavn_info:
+            try:
+                return _build_track(jsaavn_info, query, requested_by)
+            except LookupError:
+                log.warning("jiosaavn url fallback had no playable stream for %r", query)
+        raise LookupError("no results")
 
     for fetcher in (_youtube_info, _invidious_info):
         try:
