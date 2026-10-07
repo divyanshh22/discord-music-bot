@@ -578,49 +578,6 @@ def _extract_once(options: dict, query: str) -> dict | None:
     return info
 
 
-JIOSAAVN_API = "https://www.jiosaavn.com/api.php"
-
-
-def search_jiosaavn(query: str, limit: int = MAX_RESULTS) -> list[dict]:
-    """Top songs for a query from JioSaavn - no account, no bot check."""
-    params = urlencode(
-        {
-            "_format": "json",
-            "_method": "get",
-            "_page": "1",
-            "p": "1",
-            "n": str(limit),
-            "q": query,
-            "result": "song",
-            "specific": "true",
-            "__call": "search.getResults",
-        }
-    )
-    request = urllib.request.Request(
-        f"{JIOSAAVN_API}?{params}",
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        data = json.load(response)
-
-    results = []
-    for item in (data.get("results") or [])[:limit]:
-        page = item.get("perma_url")
-        if not page:
-            continue
-        artist = (item.get("primary_artists") or item.get("music") or "").strip()
-        results.append(
-            {
-                "title": item.get("song") or query,
-                "webpage_url": page,
-                "duration": int(item.get("duration") or 0) or None,
-                "artist": artist or None,
-                "thumbnail": item.get("image") or None,
-            }
-        )
-    return results
-
-
 def _ua() -> str:
     return random.choice(USER_AGENTS)
 
@@ -635,21 +592,6 @@ def _with_ua(extra: dict | None = None) -> dict:
 
 def _merge_options(extra: dict | None = None) -> dict:
     return _with_ua(extra)
-
-
-def _jiosaavn_info(query: str) -> dict | None:
-    """First JioSaavn match for a plain query, fully resolved - or None. Any failure just means "let the next source have a go", so nothing propagates."""
-    try:
-        matches = search_jiosaavn(query, limit=1)
-        if not matches:
-            log.info("jiosaavn: no match for %r", query)
-            return None
-        page = matches[0]["webpage_url"]
-        log.info("jiosaavn: %r -> %s", query, page)
-        return _extract_once(YDL_OPTIONS, page)
-    except Exception as exc:
-        log.warning("jiosaavn failed for %r: %s", query, reason_line(exc))
-        return None
 
 
 def search_soundcloud(query: str, limit: int = MAX_RESULTS) -> list[dict]:
@@ -912,13 +854,6 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         except LookupError:
             log.warning("invidious had no playable stream for %r", query)
 
-    jsaavn_info = await asyncio.to_thread(_jiosaavn_info, query)
-    if jsaavn_info:
-        try:
-            return _build_track(jsaavn_info, query, requested_by)
-        except LookupError:
-            log.warning("jiosaavn had no playable stream for %r", query)
-
     raise LookupError("no results")
 
 
@@ -937,38 +872,32 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
     results = []
     try:
-        results = search_jiosaavn(query, limit)
-        log.info("jiosaavn search: %d result(s)", len(results))
+        matches = search_soundcloud(query, limit)
+        results = [m for m in matches if _related_to(m, query)]
+        log.info("soundcloud search: %d result(s)", len(results))
     except Exception as exc:
-        log.warning("jiosaavn search failed: %s", reason_line(exc))
+        log.warning("soundcloud search failed: %s", reason_line(exc))
         results = []
-
-    if not results:
-        try:
-            matches = search_soundcloud(query, limit)
-            results = [m for m in matches if _related_to(m, query)]
-            log.info("soundcloud search: %d result(s)", len(results))
-        except Exception as exc:
-            log.warning("soundcloud search failed: %s", reason_line(exc))
-            results = []
 
     if not results:
         options = dict(YDL_OPTIONS)
         options["extract_flat"] = "in_playlist"
-
-
         options.pop("playlist_items", None)
-        try:
-            with YoutubeDL(options) as ydl:
-                info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+
+        for source_query in (f"ytmsearch{limit}:{query}", f"ytsearch{limit}:{query}"):
+            try:
+                with YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(source_query, download=False)
                 entries = [e for e in (info or {}).get("entries", []) if e]
+            except Exception as exc:
+                log.warning("youtube search failed for %s: %s", source_query, reason_line(exc))
+                continue
 
             for entry in entries:
                 url = entry.get("webpage_url") or entry.get("url")
                 if not url:
                     continue
                 if not is_url(url):
-
                     url = f"https://www.youtube.com/watch?v={url}"
                 results.append(
                     {
@@ -979,8 +908,7 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
                 )
             if results:
                 log.info("youtube search: %d result(s)", len(results))
-        except (DownloadError, LookupError) as exc:
-            log.warning("youtube search failed: %s", reason_line(exc))
+                break
 
     if not results:
         raise LookupError("no results")
@@ -1340,8 +1268,7 @@ class MusicPlayer:
         seen: set[str] = set()
         for query in queries:
             for source, limit, timeout in (
-                (search_jiosaavn, 12, 20),
-                (search_soundcloud, 8, 30),
+                (search_candidates, 12, 30),
             ):
                 try:
                     found = await asyncio.wait_for(
