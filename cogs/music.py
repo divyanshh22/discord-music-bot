@@ -318,10 +318,6 @@ async def fetch_lyrics(
 
 
 UNSUPPORTED_DOMAINS = {
-    "spotify.com": (
-        "Spotify can't be played directly - copy the song name "
-        "and search for that instead."
-    ),
     "music.apple.com": (
         "Apple Music audio is DRM-protected - copy the song name "
         "and search for that instead."
@@ -462,23 +458,16 @@ class _YDLLogger:
 
 
 YDL_OPTIONS = {
-    "format": "bestaudio/best",
-
-
-
-    "format_sort": ["abr"],
+    "format": "bestaudio[ext=m4a]/bestaudio/best",
+    "audioquality": 0,
+    "format_sort": ["quality", "vcodec:unknown", "acodec:unknown"],
     "noplaylist": True,
-
-
-
     "playlist_items": "1",
     "quiet": True,
     "no_warnings": True,
     "nocheckcertificate": True,
     "default_search": "ytsearch1",
-
-
-
+    "thumbnail": True,
     "retries": 1,
     "fragment_retries": 1,
     "socket_timeout": 15,
@@ -891,7 +880,7 @@ async def resolve_track(query: str, requested_by: str) -> Track:
 
 
 def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
-    """Top results for a query, without resolving a stream URL yet."""
+    """Top YouTube Music/YouTube results for a query, without resolving a stream URL yet."""
     query = query.strip()
     if not query:
         raise ValueError("empty query")
@@ -900,48 +889,36 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     if reason:
         raise ValueError(reason)
 
-
-
-
     results = []
-    try:
-        matches = search_soundcloud(query, limit)
-        results = [m for m in matches if _related_to(m, query)]
-        log.info("soundcloud search: %d result(s)", len(results))
-    except Exception as exc:
-        log.warning("soundcloud search failed: %s", reason_line(exc))
-        results = []
+    options = dict(YDL_OPTIONS)
+    options["extract_flat"] = "in_playlist"
+    options.pop("playlist_items", None)
 
-    if not results:
-        options = dict(YDL_OPTIONS)
-        options["extract_flat"] = "in_playlist"
-        options.pop("playlist_items", None)
+    for source_query in (f"ytmsearch{limit}:{query}", f"ytsearch{limit}:{query}"):
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(source_query, download=False)
+            entries = [e for e in (info or {}).get("entries", []) if e]
+        except Exception as exc:
+            log.warning("youtube search failed for %s: %s", source_query, reason_line(exc))
+            continue
 
-        for source_query in (f"ytmsearch{limit}:{query}", f"ytsearch{limit}:{query}"):
-            try:
-                with YoutubeDL(options) as ydl:
-                    info = ydl.extract_info(source_query, download=False)
-                entries = [e for e in (info or {}).get("entries", []) if e]
-            except Exception as exc:
-                log.warning("youtube search failed for %s: %s", source_query, reason_line(exc))
+        for entry in entries:
+            url = entry.get("webpage_url") or entry.get("url")
+            if not url:
                 continue
-
-            for entry in entries:
-                url = entry.get("webpage_url") or entry.get("url")
-                if not url:
-                    continue
-                if not is_url(url):
-                    url = f"https://www.youtube.com/watch?v={url}"
-                results.append(
-                    {
-                        "title": entry.get("title") or query,
-                        "webpage_url": url,
-                        "duration": int(entry.get("duration") or 0) or None,
-                    }
-                )
-            if results:
-                log.info("youtube search: %d result(s)", len(results))
-                break
+            if not is_url(url):
+                url = f"https://www.youtube.com/watch?v={url}"
+            results.append(
+                {
+                    "title": entry.get("title") or query,
+                    "webpage_url": url,
+                    "duration": int(entry.get("duration") or 0) or None,
+                }
+            )
+        if results:
+            log.info("youtube search: %d result(s)", len(results))
+            break
 
     if not results:
         raise LookupError("no results")
@@ -1569,7 +1546,7 @@ class Music(commands.Cog):
 
     @discord.app_commands.command(name="play", description="Play a song by name, link, or from music/.")
     @discord.app_commands.describe(
-        song="Song name, a YouTube/SoundCloud link, or a file in music/"
+        song="Song name, a YouTube/YouTube Music/Spotify link, or a file in music/"
     )
     async def play(self, interaction: discord.Interaction, song: str):
 
