@@ -187,39 +187,60 @@ def _words(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 2}
 
 
-def _autoplay_key(title: str) -> str:
-    """A title reduced to its core, so editions count as one song."""
-    text = title or ""
+def _autoplay_words(text: str) -> set[str]:
+    """Words that should influence autoplay similarity, excluding remix/mood noise."""
+    noise = {
+        "audio",
+        "cover",
+        "edit",
+        "emraan",
+        "full",
+        "hashmi",
+        "hd",
+        "lyric",
+        "lyrics",
+        "lofi",
+        "mix",
+        "music",
+        "official",
+        "remaster",
+        "remastered",
+        "reverbed",
+        "rewind",
+        "slowed",
+        "soul",
+        "song",
+        "video",
+    }
+    text = text or ""
     text = re.sub(r"\([^)]*\)", " ", text)
     text = re.sub(r"\[[^\]]*\]", " ", text)
     text = re.sub(r"[|/┬╖ΓÇôΓÇö]", " ", text)
-    words = _words(text) - {
-        "official",
-        "hd",
-        "audio",
-        "song",
-        "video",
-        "from",
-        "remastered",
-        "remaster",
-        "lyric",
-        "lyrics",
-        "music",
-        "full",
-    }
-    return " ".join(sorted(words))
+    return {w for w in _words(text) if w not in noise}
+
+
+def _autoplay_key(title: str) -> str:
+    """A title reduced to its core, so editions count as one song."""
+    return " ".join(sorted(_autoplay_words(title)))
 
 
 def _related_to(candidate: dict, query: str) -> bool:
-    """True when a search result really is about what we searched for."""
-    wanted = _words(query)
-    found = _words(candidate.get("title")) | _words(candidate.get("artist"))
-    if not wanted or not found:
+    """True when a search result is close to the same song or same-genre match."""
+    wanted = _autoplay_words(query)
+    title_words = _autoplay_words(candidate.get("title") or "")
+    artist_words = _autoplay_words(candidate.get("artist") or "")
+    if not wanted or not (title_words or artist_words):
         return False
-    if found <= wanted or wanted <= found:
+
+    title_overlap = len(wanted & title_words)
+    artist_overlap = len(wanted & artist_words)
+    if title_overlap >= 2:
         return True
-    needed = 1 if len(wanted) == 1 else 2
-    return len(wanted & found) >= needed
+    if title_overlap >= 1 and artist_overlap >= 1:
+        return True
+    if len(wanted) == 1 and title_overlap == 1:
+        return True
+    return False
 
 
 def lyrics_score(item: dict, title: str, artist: str | None, duration: int | None) -> int:
@@ -1272,7 +1293,15 @@ class MusicPlayer:
 
 
 
-        queries = [q for q in (finished.artist, finished.title) if q]
+        queries = [
+            q
+            for q in (
+                f"{finished.title} {finished.artist}" if finished.artist else finished.title,
+                finished.title,
+                finished.artist,
+            )
+            if q
+        ]
         log.info("autoplay: looking for something like %r", finished.title)
 
         track = None
