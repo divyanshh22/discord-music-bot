@@ -840,19 +840,31 @@ async def resolve_track(query: str, requested_by: str) -> Track:
             raise last_error
         return _build_track(info, query, requested_by)
 
-    info, last_error = await asyncio.wait_for(_invidious_info(query), timeout=0.9)
-    if info is not None:
+    for fetcher in (_youtube_info, _invidious_info):
         try:
-            return _build_track(info, query, requested_by)
-        except LookupError:
-            log.warning("youtube had no playable stream for %r", query)
+            info, last_error = await asyncio.wait_for(fetcher(query), timeout=0.9)
+        except (asyncio.TimeoutError, OSError):
+            continue
+        if info is not None:
+            try:
+                return _build_track(info, query, requested_by)
+            except LookupError:
+                log.warning("%s had no playable stream for %r", fetcher.__name__, query)
 
-    info, last_error = await asyncio.wait_for(_invidious_info(query), timeout=0.9)
-    if info is not None:
-        try:
-            return _build_track(info, query, requested_by)
-        except LookupError:
-            log.warning("invidious had no playable stream for %r", query)
+    try:
+        candidates = search_candidates(query, MAX_RESULTS)
+        for candidate in candidates:
+            url = candidate.get("webpage_url")
+            if not url:
+                continue
+            try:
+                info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, url)
+                if info:
+                    return _build_track(info, query, requested_by)
+            except Exception as exc:
+                log.warning("candidate resolve failed for %r: %s", url, reason_line(exc))
+    except Exception as exc:
+        log.warning("youtube search fallback failed for %r: %s", query, reason_line(exc))
 
     raise LookupError("no results")
 
