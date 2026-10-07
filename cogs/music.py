@@ -561,6 +561,15 @@ YDL_OPTIONS = {
 
 
 
+_YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIES_FILE")
+if _YOUTUBE_COOKIE_FILE:
+    if Path(_YOUTUBE_COOKIE_FILE).is_file():
+        YDL_OPTIONS["cookiefile"] = _YOUTUBE_COOKIE_FILE
+        log.info("YouTube cookies enabled from configured secret file")
+    else:
+        log.warning("YOUTUBE_COOKIES_FILE is set but the file does not exist")
+
+
 _NODE = find_node()
 if _NODE:
     YDL_OPTIONS["js_runtimes"] = {"node": {"path": _NODE}}
