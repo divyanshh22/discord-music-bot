@@ -814,6 +814,68 @@ async def _youtube_info(query: str) -> tuple[dict | None, Exception | None]:
     return None, last_error
 
 
+async def _invidious_info(query: str) -> tuple[dict | None, Exception | None]:
+    import urllib.parse as _parse
+
+    instances = list(INVIDIOUS_INSTANCES)
+    random.shuffle(instances)
+    for inst in instances[:2]:
+        try:
+            url = f"{inst.rstrip('/')}/api/v1/search?q={_parse.quote(query)}&type=video&limit=1"
+            req = urllib.request.Request(
+                url, headers={"User-Agent": _ua(), "Accept": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=0.9) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            if not data:
+                continue
+            vid = data[0]
+            video_id = vid.get("videoId") or vid.get("id")
+            if not video_id:
+                continue
+            info_url = f"{inst.rstrip('/')}/api/v1/videos/{video_id}"
+            req2 = urllib.request.Request(
+                info_url, headers={"User-Agent": _ua(), "Accept": "application/json"}
+            )
+            with urllib.request.urlopen(req2, timeout=0.9) as resp2:
+                vinfo = json.loads(resp2.read().decode("utf-8", errors="ignore"))
+            title = vinfo.get("title") or vid.get("title") or query
+            thumb = vinfo.get("videoThumbnails") or []
+            thumbnail = None
+            for t in thumb:
+                if t.get("quality") in ("maxres", "high", "medium"):
+                    thumbnail = t.get("url")
+                    break
+            if not thumbnail and thumb:
+                thumbnail = thumb[-1].get("url")
+            formats = vinfo.get("adaptiveFormats") or vinfo.get("formatStreams") or []
+            best = None
+            for f in formats:
+                if str(f.get("type", "")).startswith("audio/"):
+                    best = f
+                    break
+            if best is None and formats:
+                best = formats[-1]
+            if best is None:
+                continue
+            audio_url = best.get("url")
+            if not audio_url:
+                continue
+            return {
+                "id": video_id,
+                "title": title,
+                "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
+                "thumbnail": thumbnail,
+                "url": audio_url,
+                "extractor": "invidious",
+                "duration": vinfo.get("lengthSeconds") or vid.get("lengthSeconds") or 0,
+            }, None
+        except Exception as exc:
+            log.debug("invidious failed on %s: %s", inst, exc)
+            continue
+    return None, LookupError("invidious unavailable")
+
+
 async def resolve_track(query: str, requested_by: str) -> Track:
     """Turn a /play argument into a Track."""
     query = query.strip()
@@ -835,6 +897,20 @@ async def resolve_track(query: str, requested_by: str) -> Track:
                 raise LookupError("no results")
             raise last_error
         return _build_track(info, query, requested_by)
+
+    info, last_error = await asyncio.wait_for(_invidious_info(query), timeout=0.9)
+    if info is not None:
+        try:
+            return _build_track(info, query, requested_by)
+        except LookupError:
+            log.warning("youtube had no playable stream for %r", query)
+
+    info, last_error = await asyncio.wait_for(_invidious_info(query), timeout=0.9)
+    if info is not None:
+        try:
+            return _build_track(info, query, requested_by)
+        except LookupError:
+            log.warning("invidious had no playable stream for %r", query)
 
     jsaavn_info = await asyncio.to_thread(_jiosaavn_info, query)
     if jsaavn_info:
@@ -1972,3 +2048,5 @@ class Music(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(Music(bot))
+
+
