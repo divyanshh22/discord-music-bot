@@ -157,15 +157,24 @@ def format_time(seconds: int | None) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+def _stamp(seconds: int) -> str:
+    """`01:24` / `1:02:03` - zero-padded minutes for the progress line."""
+    text = format_time(seconds)
+    head, sep, tail = text.partition(":")
+    if sep and len(head) == 1:
+        return "0" + text
+    return text
+
+
 def progress_line(elapsed: int, total: int, width: int = 16) -> str:
-    """`0:12 ━━━━●━━━━━━━━ 3:45  •  6%` - a compact modern player bar."""
+    """``01:24 ━━━━●━━━━━━━━ 05:46`` - a compact monospace player bar."""
     ratio = min(1.0, max(0.0, elapsed / total)) if total else 0.0
     filled = round(ratio * width)
     if filled >= width:
         bar = "━" * width
     else:
         bar = "━" * filled + "●" + "─" * (width - filled - 1)
-    return f"`{format_time(elapsed)} {bar} {format_time(total)}`  •  {round(ratio * 100)}%"
+    return f"`{_stamp(elapsed)} {bar} {_stamp(total)}`"
 
 
 def source_label(track: Track) -> str:
@@ -1036,41 +1045,45 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 
 def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
-    """Audira's premium now-playing card: artwork, hierarchy, live progress."""
+    """Audira's now-playing card: title-first hierarchy, integrated artwork, live progress."""
     paused = player.is_paused
     total = track.duration
     elapsed = min(player.elapsed(), total) if total and player.current is track else 0
 
-    meta = source_label(track)
-    quality = quality_label(track)
-    meta = f"{meta}  •  {quality}" if quality else meta
-
     parts: list[str] = []
     if track.artist:
-        parts.append(f"*{track.artist}*")
+        parts.append(f"*{truncate(track.artist, 80)}*")
+        parts.append("")
     if total:
         parts.append(progress_line(elapsed, total))
+        parts.append("")
+
     status = "Ⅱ Paused" if paused else "● Playing"
     if not total:
-        status += "  •  Live"
-    parts.append(f"{status}  •  {meta}")
-    parts.append(f"Requested by **{track.requested_by}**")
+        status += " · Live"
+    parts.append(status)
 
+    meta = source_label(track)
+    quality = quality_label(track)
+    parts.append(f"{meta} · {quality}" if quality else meta)
+
+    queue_line = f"Requested by **{truncate(track.requested_by, 40)}** · Queue {len(player.queue)}"
     modes = []
+    if player.shuffle_enabled:
+        modes.append("Shuffle")
     if player.loop_mode == "song":
         modes.append("Repeat song")
     elif player.loop_mode == "queue":
         modes.append("Repeat queue")
-    if player.shuffle_enabled:
-        modes.append("Shuffle on")
     if player.autoplay:
         modes.append("Autoplay")
-    queue_line = f"Queue **{len(player.queue)}**"
     if modes:
-        queue_line += "  •  " + "  •  ".join(modes)
+        queue_line += " · " + " · ".join(modes)
     parts.append(queue_line)
+
     if player.queue:
-        parts.append(f"Up next  ·  {truncate(player.queue[0].title)}")
+        parts.append("")
+        parts.append(f"Up next · {truncate(player.queue[0].title, 80)}")
 
     embed = discord.Embed(
         title=truncate(track.title, 256),
@@ -1080,20 +1093,22 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
     )
     if track.webpage_url:
         embed.url = track.webpage_url
-    embed.set_author(name="Audira", icon_url=BRAND_ICON)
+    embed.set_author(name="AUDIRA · NOW PLAYING", icon_url=BRAND_ICON)
     if track.thumbnail:
-        embed.set_thumbnail(url=track.thumbnail)
+        embed.set_image(url=track.thumbnail)
     return embed
 
 
 def build_idle_embed(reason: str) -> discord.Embed:
     """Final card state once playback has stopped or the queue ran out."""
-    return discord.Embed(
+    embed = discord.Embed(
         title=reason,
         description="Use `/play` to start listening again.",
         colour=MUTED,
         timestamp=datetime.now(timezone.utc),
     )
+    embed.set_author(name="AUDIRA", icon_url=BRAND_ICON)
+    return embed
 
 
 class MusicPlayer:
@@ -1755,7 +1770,7 @@ class PlayerView(discord.ui.View):
                 text = "Nothing else is queued right now."
         await interaction.response.send_message(text, ephemeral=True)
 
-    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=1)
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -1778,7 +1793,7 @@ class PlayerView(discord.ui.View):
             note = "🔀 Shuffle off"
         await interaction.followup.send(note, ephemeral=True)
 
-    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
     async def repeat_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -1800,7 +1815,7 @@ class PlayerView(discord.ui.View):
         }
         await interaction.followup.send(labels[player.loop_mode], ephemeral=True)
 
-    @discord.ui.button(emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🔄", style=discord.ButtonStyle.secondary, row=2)
     async def restart_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -1815,7 +1830,7 @@ class PlayerView(discord.ui.View):
                 return
             await self._edit_card(interaction)
 
-    @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger, row=2)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -1865,7 +1880,7 @@ class PlayerView(discord.ui.View):
         pager.message = await interaction.original_response()
         pager.sync_state()
 
-    @discord.ui.button(emoji="🎵", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🎵", style=discord.ButtonStyle.secondary, row=2)
     async def lyrics_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
