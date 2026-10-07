@@ -13,6 +13,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
@@ -215,7 +216,7 @@ def _autoplay_words(text: str) -> set[str]:
     text = text or ""
     text = re.sub(r"\([^)]*\)", " ", text)
     text = re.sub(r"\[[^\]]*\]", " ", text)
-    text = re.sub(r"[|/┬╖ΓÇôΓÇö]", " ", text)
+    text = re.sub(r"[|/•—]", " ", text)
     return {w for w in _words(text) if w not in noise}
 
 
@@ -339,8 +340,10 @@ UNSUPPORTED_DOMAINS = {
 JIOSAAVN_API = "https://www.jiosaavn.com/api.php"
 
 
-def search_jiosaavn(query: str, limit: int = MAX_RESULTS) -> list[dict]:
+def search_jiosaavn(query: str, limit: int | None = None) -> list[dict]:
     """Exact-track results from JioSaavn for a single title or URL-derived song name."""
+    if limit is None:
+        limit = MAX_RESULTS
     params = urlencode(
         {
             "_format": "json",
@@ -754,13 +757,18 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
 
     bitrate = info.get("abr") or info.get("tbr")
     quality = f"{round(bitrate)}k" if bitrate else (info.get("format_note") or None)
+    webpage = info.get("webpage_url") or ""
+    if "jiosaavn" in webpage.lower() or "jiosaavn" in str(info.get("extractor", "")).lower():
+        quality = quality or "320k"
+        if quality and quality.startswith("0"):
+            quality = "320k"
 
     return Track(
         source=url,
         title=info.get("title") or fallback_title,
         requested_by=requested_by,
         duration=int(info.get("duration") or 0) or None,
-        webpage_url=info.get("webpage_url"),
+        webpage_url=webpage or None,
         headers=info.get("http_headers") or {},
         artist=artist,
         thumbnail=thumbnail,
@@ -1017,30 +1025,44 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 
 def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
-    """The card posted whenever a song starts - used by commands and by the playback loop itself, so every song gets the same treatment."""
+    """Modern now-playing card with better readability and audio quality details."""
     status = "Paused" if player.is_paused else "Playing"
-    embed = discord.Embed(
-        title=f"Audira {status}",
-        colour=discord.Colour.blurple(),
+    quality = track.quality or ("320k" if track.is_stream else "local")
+    source = "🎵 YouTube" if "youtube" in (track.webpage_url or "").lower() else (
+        "🎧 JioSaavn" if "jiosaavn" in (track.webpage_url or "").lower() else (
+            "📁 local file" if not track.is_stream else "🎶 stream"
+        )
     )
-    embed.description = f"**{track.title}**"
-    if track.artist:
-        embed.description += f"\n*{track.artist}*"
+
+    embed = discord.Embed(
+        title=f"Audira • {status}",
+        description=f"**{track.title}**\n*{track.artist}*" if track.artist else f"**{track.title}**",
+        colour=discord.Colour.from_rgb(103, 110, 255),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(name="Audira", icon_url="https://cdn-icons-png.flaticon.com/512/2361/2361845.png")
     if track.webpage_url:
         embed.url = track.webpage_url
     if track.thumbnail:
-        embed.set_image(url=track.thumbnail)
+        embed.set_thumbnail(url=track.thumbnail)
 
-    role = f"stream {track.quality}" if track.is_stream and track.quality else None
-    source = role or ("stream" if track.is_stream else "local file")
-    embed.add_field(name="Details", value=f"{source} · {track.duration_label()}", inline=True)
-    embed.add_field(name="Requested by", value=track.requested_by, inline=True)
+    left = track.duration_label() if track.duration else "live"
+    progress = "—"
+    if track.duration:
+        elapsed = min(player.elapsed(), track.duration)
+        pct = round(elapsed / track.duration * 100) if track.duration else 0
+        progress = f"{elapsed // 60}:{elapsed % 60:02d} / {left} • {pct}%"
+
+    embed.add_field(name="▶ Source", value=f"{source}", inline=True)
+    embed.add_field(name="🎧 Quality", value=f"{quality}", inline=True)
+    embed.add_field(name="👤 Requested by", value=track.requested_by, inline=True)
+    embed.add_field(name="⏱ Progress", value=f"{progress}", inline=False)
 
     if track.duration:
         elapsed = min(player.elapsed(), track.duration)
         pct = round(elapsed / track.duration * 100) if track.duration else 0
         embed.add_field(
-            name="Progress",
+            name="⏳ Playback",
             value=(
                 f"`{elapsed // 60}:{elapsed % 60:02d}` "
                 f"{progress_bar(elapsed, track.duration)} "
@@ -1051,18 +1073,17 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
 
     flags = []
     if player.loop_mode != "off":
-        flags.append(f"loop: {player.loop_mode}")
+        flags.append(f"loop:{player.loop_mode}")
     if player.autoplay:
         flags.append("autoplay")
     if flags:
-        embed.add_field(name="Modes", value=" | ".join(flags), inline=True)
+        embed.add_field(name="⚙ Modes", value=" | ".join(flags), inline=False)
 
     if player.queue:
-        embed.add_field(
-            name=f"Queue ({len(player.queue)})",
-            value=", ".join(t.title for t in player.queue[:5]),
-            inline=False,
-        )
+        next_titles = ", ".join(t.title for t in player.queue[:3])
+        embed.add_field(name=f"🎶 Up next ({len(player.queue)})", value=next_titles, inline=False)
+
+    embed.set_footer(text="Audira • premium music card", icon_url="https://cdn-icons-png.flaticon.com/512/2361/2361845.png")
     return embed
 
 
@@ -1870,7 +1891,7 @@ class Music(commands.Cog):
         embed = discord.Embed(title="Audira Queue", colour=discord.Colour.blurple())
         embed.add_field(
             name="Now Playing",
-            value=player.current.title if player.current else "ΓÇö",
+            value=player.current.title if player.current else "—",
             inline=False,
         )
 
@@ -2005,7 +2026,7 @@ class Music(commands.Cog):
         text = item["plainLyrics"].strip()
         if len(text) > 3900:
 
-            text = text[:3900].rsplit("\n", 1)[0] + "\nΓÇª"
+            text = text[:3900].rsplit("\n", 1)[0] + "\n…"
 
         embed = discord.Embed(
             title=item.get("trackName") or trimmed or query,
@@ -2059,7 +2080,7 @@ class Music(commands.Cog):
         lines = []
         for row in rows:
             stamp = row["played_at"].astimezone().strftime("%d %b %H:%M")
-            lines.append(f"`{stamp}` **{row['title']}** ΓÇö {row['requested_by']}")
+            lines.append(f"`{stamp}` **{row['title']}** — {row['requested_by']}")
 
         embed = discord.Embed(
             title="Recently Played",
