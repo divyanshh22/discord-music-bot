@@ -949,19 +949,20 @@ async def resolve_track(query: str, requested_by: str) -> Track:
                 log.warning("jiosaavn url fallback had no playable stream for %r", query)
         raise LookupError("no results")
 
-    for fetcher in (_youtube_info, _invidious_info):
-        try:
-            info, last_error = await asyncio.wait_for(fetcher(query), timeout=0.9)
-        except (asyncio.TimeoutError, OSError):
-            continue
-        if info is not None:
-            try:
-                return _build_track(info, query, requested_by)
-            except LookupError:
-                log.warning("%s had no playable stream for %r", fetcher.__name__, query)
-
+    last_error: Exception | None = None
     try:
-        candidates = search_candidates(query, MAX_RESULTS)
+        candidates = await asyncio.wait_for(
+            asyncio.to_thread(search_candidates, query, MAX_RESULTS),
+            timeout=45,
+        )
+    except asyncio.TimeoutError as exc:
+        last_error = LookupError("YouTube search timed out after 45 seconds")
+        log.warning("youtube search timed out for %r", query)
+    except Exception as exc:
+        last_error = exc
+        log.warning("youtube search failed for %r: %s", query, reason_line(exc))
+
+    if last_error is None:
         for candidate in candidates:
             url = candidate.get("webpage_url")
             if not url:
@@ -971,10 +972,11 @@ async def resolve_track(query: str, requested_by: str) -> Track:
                 if info:
                     return _build_track(info, query, requested_by)
             except Exception as exc:
+                last_error = exc
                 log.warning("candidate resolve failed for %r: %s", url, reason_line(exc))
-    except Exception as exc:
-        log.warning("youtube search fallback failed for %r: %s", query, reason_line(exc))
 
+    if last_error is not None:
+        raise LookupError(reason_line(last_error)) from last_error
     raise LookupError("no results")
 
 
@@ -989,6 +991,7 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
         raise ValueError(reason)
 
     results = []
+    last_error: Exception | None = None
     options = dict(YDL_OPTIONS)
     options["extract_flat"] = "in_playlist"
     options.pop("playlist_items", None)
@@ -999,6 +1002,7 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
                 info = ydl.extract_info(source_query, download=False)
             entries = [e for e in (info or {}).get("entries", []) if e]
         except Exception as exc:
+            last_error = exc
             log.warning("youtube search failed for %s: %s", source_query, reason_line(exc))
             continue
 
@@ -1020,6 +1024,8 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
             break
 
     if not results:
+        if last_error is not None:
+            raise LookupError(reason_line(last_error)) from last_error
         raise LookupError("no results")
     return results
 
