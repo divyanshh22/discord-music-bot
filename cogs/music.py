@@ -10,10 +10,13 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+import unicodedata
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
@@ -395,48 +398,438 @@ UNSUPPORTED_DOMAINS = {
 }
 
 JIOSAAVN_API = "https://www.jiosaavn.com/api.php"
+JIOSAAVN_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+JIOSAAVN_TIMEOUT = 15.0
+MAX_POOL = 25
+
+# How many candidates a single JioSaavn search may return and how many we keep
+# once several relaxed queries have been pooled together.
+SEARCH_EARLY_STOP = 8
+
+
+class _TTLCache:
+    """A tiny thread-safe cache. JioSaavn metadata barely changes, so caching
+    search results and entity lookups avoids duplicate network calls."""
+
+    def __init__(self, ttl_seconds: float, maxsize: int = 256):
+        self._ttl = ttl_seconds
+        self._max = maxsize
+        self._data: dict = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            hit = self._data.get(key)
+            if hit is None:
+                return None
+            value, expiry = hit
+            if expiry < time.monotonic():
+                self._data.pop(key, None)
+                return None
+            return value
+
+    def set(self, key, value) -> None:
+        with self._lock:
+            if len(self._data) >= self._max and key not in self._data:
+                oldest = min(self._data, key=lambda k: self._data[k][1])
+                self._data.pop(oldest, None)
+            self._data[key] = (value, time.monotonic() + self._ttl)
+
+
+_TRACK_CACHE = _TTLCache(300)
+_DETAIL_CACHE = _TTLCache(600)
+
+
+def _saavn_get(call: str, params: dict, *, v4: bool = False, timeout: float = JIOSAAVN_TIMEOUT, retries: int = 2):
+    """Call JioSaavn's api.php with limited retries. Blocking; run it in a thread."""
+    base = {"_format": "json", "_method": "get", "__call": call}
+    if v4:
+        base.update({"_marker": "0", "api_version": "4", "ctx": "web6dot0"})
+    base.update(params)
+    url = f"{JIOSAAVN_API}?{urlencode(base)}"
+
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": JIOSAAVN_UA, "Accept": "application/json"}
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.load(response)
+        except Exception as exc:  # noqa: BLE001 - retried below
+            last = exc
+            if attempt < retries:
+                time.sleep(0.6 * (attempt + 1))
+    raise last if last is not None else LookupError("JioSaavn request failed")
+
+
+def _thumb(url: str | None) -> str | None:
+    if not url:
+        return None
+    return re.sub(r"\d+x\d+", "500x500", url)
+
+
+def _jiosaavn_song_id(url: str | None) -> str | None:
+    """The perma-url token for a JioSaavn song, e.g. .../song/khat/OSMIAyZ1Wws -> OSMIAyZ1Wws."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    host = parsed.netloc.lower().split(":")[0].replace("www.", "")
+    if host != "jiosaavn.com" and not host.endswith(".jiosaavn.com"):
+        return None
+    parts = [p for p in (parsed.path or "").split("/") if p]
+    return parts[-1] if parts else None
+
+
+def _normalize_song_item(item: dict) -> dict | None:
+    """Turn one JioSaavn song object (v3 search or v4 entity shape) into our candidate dict."""
+    if not isinstance(item, dict):
+        return None
+    page = item.get("perma_url")
+    if not page:
+        return None
+
+    more = item.get("more_info") or {}
+    artist_map = more.get("artistMap") or {}
+    primary = [
+        (a.get("name") or "").strip()
+        for a in (artist_map.get("primary_artists") or [])
+        if (a.get("name") or "").strip()
+    ]
+    artist_ids = [
+        str(a.get("id"))
+        for a in (artist_map.get("primary_artists") or [])
+        if a.get("id")
+    ]
+
+    artist = (item.get("primary_artists") or "").strip()
+    if not artist and primary:
+        artist = ", ".join(primary)
+    if not artist:
+        subtitle = item.get("subtitle") or ""
+        artist = subtitle.split(" - ", 1)[0].strip()
+    artist = artist.replace("&amp;", "&").strip() or None
+
+    title = (item.get("song") or item.get("title") or "").strip()
+    if not title:
+        return None
+    title = title.replace("&amp;", "&")
+
+    album = (item.get("album") or more.get("album") or "").strip() or None
+    if album:
+        album = album.replace("&amp;", "&")
+
+    duration = item.get("duration") or more.get("duration")
+    try:
+        duration = int(duration) if duration not in (None, "") else None
+    except (TypeError, ValueError):
+        duration = None
+
+    song_id = item.get("id") or _jiosaavn_song_id(page)
+
+    return {
+        "id": str(song_id) if song_id else None,
+        "title": title,
+        "artist": artist,
+        "artist_ids": artist_ids,
+        "album": album,
+        "album_id": str(more.get("album_id")) if more.get("album_id") else None,
+        "duration": duration or None,
+        "language": (item.get("language") or more.get("language") or None),
+        "year": (item.get("year") or more.get("year") or None),
+        "webpage_url": page,
+        "thumbnail": _thumb(item.get("image") or more.get("image")),
+    }
 
 
 def search_jiosaavn(query: str, limit: int | None = None) -> list[dict]:
-    """Exact-track results from JioSaavn for a single title or URL-derived song name."""
+    """Normalized JioSaavn song results for a single query (cached)."""
     if limit is None:
         limit = MAX_RESULTS
-    params = urlencode(
+    query = query.strip()
+    if not query:
+        return []
+
+    key = ("search", query.lower(), limit)
+    cached = _TRACK_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    data = _saavn_get(
+        "search.getResults",
         {
-            "_format": "json",
-            "_method": "get",
             "_page": "1",
             "p": "1",
             "n": str(limit),
             "q": query,
             "result": "song",
             "specific": "true",
-            "__call": "search.getResults",
-        }
+        },
     )
-    request = urllib.request.Request(
-        f"{JIOSAAVN_API}?{params}",
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        data = json.load(response)
 
-    results = []
+    results: list[dict] = []
     for item in (data.get("results") or [])[:limit]:
-        page = item.get("perma_url")
-        if not page:
-            continue
-        artist = (item.get("primary_artists") or item.get("music") or "").strip()
-        results.append(
-            {
-                "title": item.get("song") or query,
-                "webpage_url": page,
-                "duration": int(item.get("duration") or 0) or None,
-                "artist": artist or None,
-                "thumbnail": item.get("image") or None,
-            }
-        )
+        candidate = _normalize_song_item(item)
+        if candidate:
+            results.append(candidate)
+
+    _TRACK_CACHE.set(key, results)
     return results
+
+
+# --- Query understanding -------------------------------------------------
+
+_ACCENT = re.compile(r"[\u0300-\u036f]")
+
+# Words that mark a specific edition of a song. A shared word must never be the
+# only reason two tracks are considered the same.
+_VERSION_WORDS = {
+    "remix", "remixes", "rmx", "mashup", "live", "acoustic", "unplugged",
+    "instrumental", "karaoke", "cover", "slowed", "reverb", "reverbed",
+    "sped", "spedup", "lofi", "lo-fi", "extended", "radio", "edit",
+    "version", "remaster", "remastered", "reprise", "demo", "session",
+    "sessions", "8d", "tribute", "duet",
+}
+_VERSION_ALIASES = {
+    "remixes": "remix",
+    "rmx": "remix",
+    "remastered": "remaster",
+    "reverbed": "reverb",
+    "spedup": "sped",
+    "lo-fi": "lofi",
+}
+_STOPWORDS = {
+    "and", "the", "a", "an", "of", "to", "in", "on", "by", "from", "for",
+    "feat", "ft", "featuring", "with", "vs",
+}
+_BRACKETS = re.compile(r"[\(\[]([^\)\]]*)[\)\]]")
+
+
+def _strip_accents(text: str) -> str:
+    return _ACCENT.sub("", unicodedata.normalize("NFKD", text or ""))
+
+
+def _norm_text(text: str) -> str:
+    """Lowercase, unify '&'/'and', drop punctuation, collapse whitespace."""
+    text = _strip_accents(text).lower()
+    text = text.replace("&", " and ")
+    text = re.sub(r"[\(\)\[\]\{\}\|/•·,.\-_!?\"'’`~@#$%^*+=<>:;]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _content_tokens(text: str) -> set[str]:
+    return {w for w in _norm_text(text).split() if w not in _STOPWORDS and len(w) > 1}
+
+
+def _version_tags(text: str) -> frozenset[str]:
+    """Edition descriptors present in a title/query (remix, live, slowed...)."""
+    tags: set[str] = set()
+    for chunk in _BRACKETS.findall(text or ""):
+        for word in re.findall(r"[a-z0-9\-]+", _norm_text(chunk)):
+            if word in _VERSION_WORDS:
+                tags.add(_VERSION_ALIASES.get(word, word))
+    outside = _BRACKETS.sub(" ", text or "")
+    for word in re.findall(r"[a-z0-9\-]+", _norm_text(outside)):
+        if word in _VERSION_WORDS:
+            tags.add(_VERSION_ALIASES.get(word, word))
+    return frozenset(tags)
+
+
+def _title_core(text: str) -> str:
+    """The main title with edition tags and 'feat.' credits removed."""
+    text = _BRACKETS.sub(" ", text or "")
+    text = re.sub(r"\b(feat|ft|featuring|with)\b\.?.*$", " ", text, flags=re.I)
+    words = [
+        w
+        for w in _norm_text(text).split()
+        if w not in _VERSION_WORDS and w not in {"remix", "version"}
+    ]
+    return " ".join(words).strip()
+
+
+def _parse_query(query: str) -> dict:
+    core = _title_core(query)
+    return {
+        "raw": query,
+        "core": core,
+        "version": _version_tags(query),
+        "tokens": _content_tokens(core),
+    }
+
+
+def _search_queries(query: str, spec: dict) -> list[str]:
+    """Progressive relaxation: full query, then the title core, then shorter cores.
+
+    This is what rescues queries like 'Khat Navjot Ahuja Dream Note', where the
+    combined search returns nothing even though 'Khat Navjot Ahuja' matches.
+    """
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        value = (value or "").strip()
+        if value and value.lower() not in seen:
+            seen.add(value.lower())
+            ordered.append(value)
+
+    add(query)
+    core = spec.get("core") or ""
+    add(core)
+    words = core.split()
+    for size in range(len(words) - 1, 0, -1):
+        add(" ".join(words[:size]))
+    if " - " in query:
+        add(query.split(" - ", 1)[0])
+    return ordered
+
+
+def _title_similarity(spec: dict, title: str) -> tuple[float, bool]:
+    """Blend of exact match, token overlap and edit distance for the plain title."""
+    q_core = _norm_text(spec.get("core") or "")
+    c_core = _norm_text(_title_core(title))
+    if not q_core or not c_core:
+        return 0.0, False
+    if q_core == c_core:
+        return 1.0, True
+
+    q_tokens = set(q_core.split())
+    c_tokens = set(c_core.split())
+    inter = q_tokens & c_tokens
+    union = q_tokens | c_tokens
+    jaccard = len(inter) / len(union) if union else 0.0
+    containment = len(inter) / len(c_tokens) if c_tokens else 0.0
+    ratio = SequenceMatcher(None, q_core, c_core).ratio()
+    sim = max(jaccard, 0.75 * containment + 0.25 * ratio, ratio)
+    return min(1.0, sim), False
+
+
+def score_candidate(
+    candidate: dict,
+    spec: dict,
+    *,
+    reference_duration: int | None = None,
+    position: int = 0,
+) -> tuple[float, dict]:
+    """A weighted 0..1 confidence that `candidate` is the song the user asked for.
+
+    Title similarity dominates; an artist named in the query is required when the
+    candidate's own title doesn't account for those words. Editions (remix/live/
+    slowed...) are matched explicitly so a plain request never silently returns a
+    different recording.
+    """
+    title = candidate.get("title") or ""
+    artist = candidate.get("artist") or ""
+    q_tokens = spec.get("tokens") or set()
+    requested_versions = spec.get("version") or set()
+
+    title_sim, exact = _title_similarity(spec, title)
+    score = 0.60 * title_sim
+    if exact:
+        score += 0.10
+
+    candidate_title_tokens = _content_tokens(title)
+    artist_tokens = _content_tokens(artist)
+    # Query words the candidate's title doesn't explain are treated as an artist
+    # hint: "Flashing Lights Kanye West" -> {kanye, west}.
+    artist_hint = q_tokens - candidate_title_tokens - set(requested_versions)
+
+    artist_mismatch = False
+    artist_sim = 1.0
+    if artist_hint:
+        if artist_tokens:
+            overlap = len(artist_hint & artist_tokens)
+            artist_sim = overlap / len(artist_hint)
+        else:
+            artist_sim = 0.0
+        if artist_sim <= 0.0:
+            artist_mismatch = True
+            score -= 0.30
+        else:
+            score += 0.30 * min(1.0, artist_sim)
+    else:
+        score += 0.12
+
+    candidate_versions = _version_tags(title)
+    if requested_versions:
+        if requested_versions <= candidate_versions:
+            score += 0.12
+        elif requested_versions & candidate_versions:
+            score += 0.04
+        else:
+            score -= 0.35
+    elif candidate_versions:
+        score -= 0.12
+    else:
+        score += 0.10
+
+    if reference_duration and candidate.get("duration"):
+        diff = abs(int(candidate["duration"]) - int(reference_duration))
+        if diff <= 5:
+            score += 0.10
+        elif diff <= 15:
+            score += 0.03
+        elif diff > 30:
+            score -= 0.12
+
+    # Keep JioSaavn's own relevance ordering (which reflects popularity) but only
+    # as a small tie-breaker that decays with position.
+    score += 0.08 * (0.85 ** max(0, position))
+
+    signals = {
+        "exact_title": exact,
+        "title_similarity": round(title_sim, 3),
+        "artist_similarity": round(artist_sim, 3),
+        "artist_hint": bool(artist_hint),
+        "artist_mismatch": artist_mismatch,
+        "versions": sorted(candidate_versions),
+    }
+    return max(0.0, min(1.0, score)), signals
+
+
+def rank_candidates(
+    candidates: list[dict],
+    spec: dict,
+    *,
+    reference_duration: int | None = None,
+) -> list[tuple[float, dict, dict]]:
+    """Score every candidate and return them strongest-first."""
+    ranked: list[tuple[float, dict, dict]] = []
+    for position, candidate in enumerate(candidates):
+        score, signals = score_candidate(
+            candidate, spec, reference_duration=reference_duration, position=position
+        )
+        ranked.append((score, candidate, signals))
+    ranked.sort(key=lambda row: row[0], reverse=True)
+    return ranked
+
+
+def _search_pool(query: str, spec: dict, limit: int = MAX_POOL) -> list[dict]:
+    """Pool normalized candidates from the full query and its relaxed fallbacks."""
+    pool: list[dict] = []
+    seen: set = set()
+    for q in _search_queries(query, spec):
+        try:
+            found = search_jiosaavn(q, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("JioSaavn search failed for %r: %s", q, reason_line(exc))
+            continue
+        for candidate in found:
+            key = candidate.get("id") or candidate.get("webpage_url")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            pool.append(candidate)
+        if len(pool) >= limit:
+            break
+        if q == query and len(pool) >= SEARCH_EARLY_STOP:
+            break
+    return pool
 
 
 def _extract_title_from_url(url: str) -> str | None:
@@ -528,6 +921,9 @@ class Track:
         temp_path: str | None = None,
         start_offset: int = 0,
         quality: str | None = None,
+        song_id: str | None = None,
+        album: str | None = None,
+        language: str | None = None,
     ):
         self.source = source
         self.title = title
@@ -550,6 +946,11 @@ class Track:
         self.temp_path = temp_path
         self.start_offset = start_offset
         self.quality = quality
+
+        # JioSaavn identity, used to detect duplicates and to seed autoplay.
+        self.song_id = song_id or _jiosaavn_song_id(webpage_url)
+        self.album = album
+        self.language = language
 
     def cleanup(self) -> None:
         """Delete the temporary file backing this track, if there is one."""
@@ -790,8 +1191,20 @@ def _soundcloud_info(query: str, limit: int = 5) -> dict | None:
     return None
 
 
-def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
-    """Turn an extraction result into a playable Track."""
+def _build_track(
+    info: dict,
+    fallback_title: str,
+    requested_by: str,
+    *,
+    candidate: dict | None = None,
+) -> Track:
+    """Turn an extraction result into a playable Track.
+
+    Metadata from the winning JioSaavn candidate (artist/album/language/artwork)
+    fills in whatever yt-dlp didn't report, so the queue and autoplay have a
+    consistent identity for every track.
+    """
+    candidate = candidate or {}
     url = info.get("url")
     if not url:
 
@@ -805,13 +1218,16 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
         artist = artist.strip() or None
     else:
         artist = None
+    artist = artist or candidate.get("artist")
+
     thumbnail = info.get("thumbnail")
     if thumbnail and not isinstance(thumbnail, str):
         thumbnail = None
+    thumbnail = thumbnail or candidate.get("thumbnail")
 
     bitrate = info.get("abr") or info.get("tbr")
     quality = f"{round(bitrate)}k" if bitrate else (info.get("format_note") or None)
-    webpage = info.get("webpage_url") or ""
+    webpage = info.get("webpage_url") or candidate.get("webpage_url") or ""
     if "jiosaavn" in webpage.lower() or "jiosaavn" in str(info.get("extractor", "")).lower():
         quality = quality or "320k"
         if quality and quality.startswith("0"):
@@ -819,14 +1235,17 @@ def _build_track(info: dict, fallback_title: str, requested_by: str) -> Track:
 
     return Track(
         source=url,
-        title=info.get("title") or fallback_title,
+        title=info.get("title") or candidate.get("title") or fallback_title,
         requested_by=requested_by,
-        duration=int(info.get("duration") or 0) or None,
+        duration=int(info.get("duration") or candidate.get("duration") or 0) or None,
         webpage_url=webpage or None,
         headers=info.get("http_headers") or {},
         artist=artist,
         thumbnail=thumbnail,
         quality=quality,
+        song_id=candidate.get("id") or _jiosaavn_song_id(webpage),
+        album=info.get("album") or candidate.get("album"),
+        language=info.get("language") or candidate.get("language"),
     )
 
 def _cut_track(track: Track, seconds: int) -> Track | None:
@@ -876,6 +1295,9 @@ def _cut_track(track: Track, seconds: int) -> Track | None:
         temp_path=target,
         start_offset=(track.start_offset or 0) + seconds,
         quality=track.quality,
+        song_id=track.song_id,
+        album=track.album,
+        language=track.language,
     )
 
 
@@ -971,6 +1393,12 @@ async def _invidious_info(query: str) -> tuple[dict | None, Exception | None]:
     return None, LookupError("invidious unavailable")
 
 
+# Confidence bands for search-result selection.
+CONFIDENCE_HIGH = 0.62
+CONFIDENCE_MEDIUM = 0.40
+CONFIDENCE_MARGIN = 0.15
+
+
 async def resolve_track(query: str, requested_by: str) -> Track:
     """Resolve local files or JioSaavn tracks; never stream from other platforms."""
     query = query.strip()
@@ -1002,46 +1430,278 @@ async def resolve_track(query: str, requested_by: str) -> Track:
     last_error: Exception | None = None
     try:
         candidates = await asyncio.wait_for(
-            asyncio.to_thread(search_candidates, query, MAX_RESULTS),
-            timeout=30,
+            asyncio.to_thread(search_candidates, query, MAX_POOL),
+            timeout=45,
         )
     except asyncio.TimeoutError as exc:
-        raise LookupError("JioSaavn search timed out after 30 seconds") from exc
+        raise LookupError("JioSaavn search timed out after 45 seconds") from exc
     except Exception as exc:
         raise LookupError(reason_line(exc)) from exc
 
+    if not candidates:
+        raise LookupError("no results")
+
+    best_score = float(candidates[0].get("score") or 0.0)
+    best_signals = candidates[0].get("signals") or {}
+
+    if best_signals.get("artist_hint") and best_signals.get("artist_mismatch"):
+        raise LookupError(
+            f"I couldn't find **{query}** by that artist on JioSaavn. "
+            "Check the spelling or try a different search."
+        )
+
+    if best_score < CONFIDENCE_MEDIUM:
+        raise LookupError(
+            f"I wasn't confident enough that any JioSaavn result is **{query}**. "
+            "Try adding the artist name or a more specific title."
+        )
+
+    artist_required = bool(best_signals.get("artist_hint"))
+    threshold = max(CONFIDENCE_MEDIUM, best_score - CONFIDENCE_MARGIN)
+    log.info(
+        "resolving %r: best=%.2f (%r by %r)",
+        query,
+        best_score,
+        candidates[0].get("title"),
+        candidates[0].get("artist"),
+    )
+
     for candidate in candidates:
+        score = float(candidate.get("score") or 0.0)
+        if score < threshold:
+            break
+        signals = candidate.get("signals") or {}
+        if artist_required and signals.get("artist_mismatch"):
+            continue
         url = candidate.get("webpage_url")
         if not url:
             continue
         try:
             info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, url)
             if info:
-                return _build_track(info, query, requested_by)
+                return _build_track(info, query, requested_by, candidate=candidate)
         except Exception as exc:
             last_error = exc
             log.warning("JioSaavn candidate resolve failed for %r: %s", url, reason_line(exc))
 
     if last_error is not None:
         raise LookupError(reason_line(last_error)) from last_error
-    raise LookupError("no results")
+    raise LookupError("no playable result")
 
 
 def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
-    """Search JioSaavn and return selectable song results."""
+    """Search JioSaavn (with query relaxation) and return candidates ranked by
+    how well they match the requested title, artist, version and duration."""
     query = query.strip()
     if not query:
         raise ValueError("empty query")
 
+    spec = _parse_query(query)
     try:
-        results = search_jiosaavn(query, limit=limit)
+        pool = _search_pool(query, spec, limit=max(limit, SEARCH_EARLY_STOP))
+    except LookupError:
+        raise
     except Exception as exc:
         log.warning("JioSaavn search failed for %r: %s", query, reason_line(exc))
         raise LookupError(reason_line(exc)) from exc
-    if not results:
+
+    if not pool:
         raise LookupError("no results")
-    log.info("JioSaavn search: %d result(s)", len(results))
+
+    ranked = rank_candidates(pool, spec)
+    log.info(
+        "JioSaavn search %r: %d candidate(s), best=%.2f %r by %r",
+        query,
+        len(pool),
+        ranked[0][0],
+        ranked[0][1].get("title"),
+        ranked[0][1].get("artist"),
+    )
+
+    results: list[dict] = []
+    for score, candidate, signals in ranked[:limit]:
+        enriched = dict(candidate)
+        enriched["score"] = round(score, 3)
+        enriched["signals"] = signals
+        results.append(enriched)
     return results
+
+
+# --- JioSaavn recommendations (used by autoplay) -------------------------
+#
+# JioSaavn's own "You Might Like" (reco.getreco) is not reliably populated via
+# api.php, so we lean on the metadata that *is* dependable: a track's primary
+# artists, its album, and the artist page's `similarArtists` (genre/style kin).
+# Everything here ultimately yields normal song candidates that resolve through
+# the same yt-dlp JioSaavn extractor as ordinary search.
+
+
+def _saavn_song_detail(song_token: str) -> dict | None:
+    """Rich metadata for one song (artist ids, album, language...)."""
+    if not song_token:
+        return None
+    key = ("song", song_token)
+    cached = _DETAIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        data = _saavn_get(
+            "webapi.get",
+            {"type": "song", "token": song_token, "n": "1", "p": "1"},
+            v4=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.info("jiosaavn song detail failed for %s: %s", song_token, reason_line(exc))
+        return None
+    songs = data.get("songs") or []
+    detail = _normalize_song_item(songs[0]) if songs else None
+    if detail:
+        _DETAIL_CACHE.set(key, detail)
+    return detail
+
+
+def _saavn_artist_page(artist_id: str) -> dict | None:
+    if not artist_id:
+        return None
+    key = ("artist", str(artist_id))
+    cached = _DETAIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        data = _saavn_get(
+            "artist.getArtistPageDetails", {"artistId": str(artist_id)}, v4=True
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.info("jiosaavn artist page failed for %s: %s", artist_id, reason_line(exc))
+        return None
+    if isinstance(data, dict):
+        _DETAIL_CACHE.set(key, data)
+        return data
+    return None
+
+
+def _saavn_similar_artists(artist_id: str) -> list[dict]:
+    page = _saavn_artist_page(artist_id) or {}
+    similar = page.get("similarArtists") or []
+    return [a for a in similar if isinstance(a, dict) and a.get("id")]
+
+
+def _saavn_artist_other_top_songs(
+    artist_ids: list[str], song_id: str | None, language: str | None, limit: int = 12
+) -> list[dict]:
+    """Other popular tracks by the same artist(s) - JioSaavn's own related-songs rail."""
+    if not artist_ids:
+        return []
+    params = {
+        "artist_ids": ",".join(str(a) for a in artist_ids if a),
+        "song_id": song_id or "",
+        "n": str(limit),
+        "p": "1",
+    }
+    if language:
+        params["language"] = language
+    key = ("artist_other", params["artist_ids"], song_id, language, limit)
+    cached = _DETAIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        data = _saavn_get("search.artistOtherTopSongs", params, v4=True)
+    except Exception as exc:  # noqa: BLE001
+        log.info("jiosaavn same-artist songs failed: %s", reason_line(exc))
+        return []
+    results = []
+    for item in data if isinstance(data, list) else []:
+        candidate = _normalize_song_item(item)
+        if candidate:
+            results.append(candidate)
+    _DETAIL_CACHE.set(key, results)
+    return results
+
+
+def _saavn_album_tracks(album_id: str, limit: int = 30) -> list[dict]:
+    """Other tracks on the same album."""
+    if not album_id:
+        return []
+    key = ("album", str(album_id))
+    cached = _DETAIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        data = _saavn_get("content.getAlbumDetails", {"albumid": str(album_id)}, v4=True)
+    except Exception as exc:  # noqa: BLE001
+        log.info("jiosaavn album tracks failed for %s: %s", album_id, reason_line(exc))
+        return []
+    songs = data.get("list") or data.get("songs") or [] if isinstance(data, dict) else []
+    results: list[dict] = []
+    for item in songs[:limit]:
+        candidate = _normalize_song_item(item)
+        if candidate:
+            results.append(candidate)
+    _DETAIL_CACHE.set(key, results)
+    return results
+
+
+def _saavn_reco(song_id: str | None, language: str | None, limit: int = 12) -> list[dict]:
+    """JioSaavn's 'You Might Like' rail, when it has anything for this song."""
+    if not song_id:
+        return []
+    params = {"pid": song_id, "n": str(limit), "p": "1"}
+    if language:
+        params["language"] = language
+    key = ("reco", song_id, language, limit)
+    cached = _DETAIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        data = _saavn_get("reco.getreco", params, v4=True)
+    except Exception as exc:  # noqa: BLE001
+        log.info("jiosaavn reco failed for %s: %s", song_id, reason_line(exc))
+        return []
+    results = []
+    for item in data if isinstance(data, list) else []:
+        candidate = _normalize_song_item(item)
+        if candidate:
+            results.append(candidate)
+    _DETAIL_CACHE.set(key, results)
+    return results
+
+
+def _resolve_song_detail(finished: Track) -> dict | None:
+    """Identify the finished track on JioSaavn, using its link or a title search."""
+    token = finished.song_id or _jiosaavn_song_id(finished.webpage_url)
+    if token:
+        detail = _saavn_song_detail(token)
+        if detail:
+            return detail
+    # Local file or a link we couldn't read: fall back to a ranked title search.
+    query = f"{finished.title} {finished.artist}".strip() if finished.artist else finished.title
+    try:
+        spec = _parse_query(query)
+        pool = _search_pool(query, spec)
+        if not pool:
+            return None
+        ranked = rank_candidates(
+            pool, spec, reference_duration=finished.duration
+        )
+        if not ranked or ranked[0][0] < CONFIDENCE_MEDIUM:
+            return None
+        return ranked[0][1]
+    except Exception as exc:  # noqa: BLE001
+        log.info("could not identify %r for autoplay: %s", finished.title, reason_line(exc))
+        return None
+
+
+def _track_identity(track: Track) -> str:
+    """A stable key for dedup: prefer the JioSaavn id, else the normalized title."""
+    if track.song_id:
+        return f"id:{track.song_id}"
+    return "t:" + _autoplay_key(track.title)
+
+
+def _candidate_identity(candidate: dict) -> str:
+    if candidate.get("id"):
+        return f"id:{candidate['id']}"
+    return "t:" + _autoplay_key(candidate.get("title") or "")
 
 
 def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
@@ -1137,6 +1797,9 @@ class MusicPlayer:
         self._skip_once = False
 
         self._recent: list[str] = []
+
+        # Guards against two autoplay lookups racing for the same guild.
+        self._autoplay_busy = False
 
         self.history: list[Track] = []
         self.shuffle_enabled = False
@@ -1424,122 +2087,164 @@ class MusicPlayer:
 
             self._skip_once = False
 
-    async def _first_playable(self, candidates: list[dict], finished: Track) -> Track | None:
-        """First candidate that resolves and isn't a song we already played."""
-        played = set(self._recent)
-        finished_key = _autoplay_key(finished.title)
-        for candidate in candidates:
-            title = candidate.get("title") or ""
-            key = _autoplay_key(title)
-            if not key or key == finished_key or key in played:
+    def _autoplay_candidates(self, finished: Track) -> list[tuple[float, dict]]:
+        """Gather JioSaavn tracks related to `finished`, weighted by relationship.
+
+        Nothing here looks at title keywords. Recommendations come from the
+        track's own artist(s), its album and JioSaavn's similar-artist graph, so
+        a song is never suggested just because it shares a word with the title.
+        """
+        detail = _resolve_song_detail(finished)
+        song_id = None
+        language = finished.language
+        artist_ids: list[str] = []
+        album_id = None
+        if detail:
+            song_id = detail.get("id") or _jiosaavn_song_id(detail.get("webpage_url"))
+            language = detail.get("language") or language
+            artist_ids = [str(a) for a in (detail.get("artist_ids") or []) if a]
+            album_id = detail.get("album_id")
+
+        weighted: list[tuple[float, dict]] = []
+
+        def add(weight: float, items: list[dict]) -> None:
+            for item in items:
+                weighted.append((weight, item))
+
+        # 1. JioSaavn's own "You Might Like" rail (when populated).
+        if song_id:
+            add(1.00, _saavn_reco(song_id, language))
+        # 2. More from the same primary artist(s): closest style match.
+        if artist_ids:
+            add(0.95, _saavn_artist_other_top_songs(artist_ids, song_id, language))
+        # 3. Other tracks from the same album.
+        if album_id:
+            add(0.90, _saavn_album_tracks(album_id))
+        # 4. Similar artists (JioSaavn's genre/style graph), then their songs.
+        similar = _saavn_similar_artists(artist_ids[0]) if artist_ids else []
+        for artist in similar[:5]:
+            related = _saavn_artist_other_top_songs(
+                [str(artist["id"])],
+                song_id,
+                artist.get("language") or language,
+                limit=8,
+            )
+            if not related:
+                page = _saavn_artist_page(str(artist["id"])) or {}
+                related = [
+                    c
+                    for c in (
+                        _normalize_song_item(s) for s in (page.get("topSongs") or [])
+                    )
+                    if c
+                ]
+            add(0.70, related)
+
+        log.info(
+            "autoplay: %d related track(s) discovered for %r",
+            len(weighted),
+            finished.title,
+        )
+        return weighted
+
+    def _rank_autoplay(
+        self, weighted: list[tuple[float, dict]], finished: Track
+    ) -> list[tuple[float, dict]]:
+        """Deduplicate related tracks, drop recent/current ones, and order by weight."""
+        recent = set(self._recent)
+        finished_id = _track_identity(finished)
+        finished_title = _autoplay_key(finished.title)
+
+        best: dict[str, tuple[float, dict]] = {}
+        for weight, candidate in weighted:
+            if not candidate.get("webpage_url"):
+                continue
+            identity = _candidate_identity(candidate)
+            if identity == finished_id or identity in recent:
+                continue
+            title_key = _autoplay_key(candidate.get("title") or "")
+            if not title_key or title_key == finished_title:
+                continue
+            score = weight
+            if finished.language and candidate.get("language") == finished.language:
+                score += 0.05
+            prior = best.get(identity)
+            if prior is None or score > prior[0]:
+                best[identity] = (score, candidate)
+        return sorted(best.values(), key=lambda row: row[0], reverse=True)
+
+    async def _first_related(
+        self, ranked: list[tuple[float, dict]], finished: Track
+    ) -> Track | None:
+        """Resolve the strongest related candidate that actually streams."""
+        for _score, candidate in ranked:
+            url = candidate.get("webpage_url")
+            if not url:
                 continue
             try:
-                track = await resolve_track(
-                    candidate["webpage_url"], finished.requested_by
+                return await asyncio.wait_for(
+                    resolve_track(url, finished.requested_by), timeout=60
                 )
-            except (DownloadError, LookupError, ValueError) as exc:
-                log.warning("autoplay could not resolve %s: %s", title, exc)
-                continue
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - try the next candidate
                 log.warning(
-                    "autoplay resolve broke for %s: %s: %s",
-                    title,
-                    type(exc).__name__,
-                    exc,
+                    "autoplay could not resolve %r: %s",
+                    candidate.get("title"),
+                    reason_line(exc),
                 )
                 continue
-            return track
         return None
 
     async def _queue_autoplay(self, finished: Track) -> None:
-        """Keep the music going with something similar when the queue runs dry."""
-        if not self.voice.is_connected():
+        """Keep the music going with a genuinely related JioSaavn track."""
+        if not self.autoplay or not self.voice.is_connected():
+            return
+        if self._autoplay_busy:
             return
         channel = self.voice.channel
         if channel is not None and len([m for m in channel.members if not m.bot]) == 0:
             log.info("autoplay off - nobody is listening")
             return
 
-        self._recent.append(_autoplay_key(finished.title))
-        self._recent = self._recent[-15:]
+        self._recent.append(_track_identity(finished))
+        self._recent = self._recent[-20:]
 
+        self._autoplay_busy = True
+        try:
+            log.info("autoplay: finding music related to %r", finished.title)
+            try:
+                weighted = await asyncio.wait_for(
+                    asyncio.to_thread(self._autoplay_candidates, finished), timeout=45
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "autoplay lookup failed for %r: %s",
+                    finished.title,
+                    type(exc).__name__,
+                )
+                weighted = []
 
+            ranked = self._rank_autoplay(weighted, finished)
 
-        queries = [
-            q
-            for q in (
-                f"{finished.title} {finished.artist}" if finished.artist else finished.title,
-                finished.title,
-                finished.artist,
-            )
-            if q
-        ]
-        log.info("autoplay: looking for something like %r", finished.title)
+            # A listener may have queued something while we were fetching.
+            if self.queue or not self.autoplay or not self.voice.is_connected():
+                return
 
-        track = None
-        candidates: list[dict] = []
-        seen: set[str] = set()
-        for query in queries:
-            for source, limit, timeout in (
-                (search_candidates, 12, 30),
-            ):
-                try:
-                    found = await asyncio.wait_for(
-                        asyncio.to_thread(source, query, limit),
-                        timeout=timeout,
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "autoplay %s search failed for %r: %s",
-                        source.__name__,
-                        query,
-                        type(exc).__name__,
-                    )
-                    continue
-                for cand in found:
-                    url = cand.get("webpage_url")
-                    if not url or url in seen:
-                        continue
-                    seen.add(url)
-                    if _related_to(cand, query):
-                        candidates.append(cand)
-            if candidates:
-                break
-            log.info("autoplay: %r gave no similar candidates yet", query)
+            track = await self._first_related(ranked, finished)
+            if track is None:
+                log.info("autoplay found nothing related to play")
+                self._notify("Autoplay couldn't find anything similar to play.")
+                return
 
-        if candidates:
-            log.info("autoplay: %d candidate(s) pooled", len(candidates))
-            track = await self._first_playable(candidates, finished)
+            # Re-check after the (awaited) resolution: manual queues win.
+            if self.queue or not self.autoplay or not self.voice.is_connected():
+                track.cleanup()
+                return
 
-        if track is None and queries:
-            for query in queries:
-                try:
-                    candidates = await asyncio.wait_for(
-                        asyncio.to_thread(search_candidates, query, limit=10),
-                        timeout=60,
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "autoplay search failed for %r: %s",
-                        query,
-                        type(exc).__name__,
-                    )
-                    continue
-                if not candidates:
-                    continue
-                log.info("autoplay: %r -> %d fallback candidate(s)", query, len(candidates))
-                track = await self._first_playable(candidates, finished)
-                if track:
-                    break
-
-        if track is None:
-            log.info("autoplay found nothing new to play")
-            self._notify("Autoplay couldn't find anything similar to play.")
-            return
-
-        log.info("autoplay picked %s", track.title)
-        self.queue.append(track)
-        self._notify(f"Autoplay: **{track.title}**")
+            log.info("autoplay picked %s", track.title)
+            self.queue.append(track)
+            self._notify(f"Autoplay: **{track.title}**")
+        finally:
+            self._autoplay_busy = False
 
     def _notify(self, message: str) -> None:
         """Best-effort notice in the channel that started playback."""
@@ -2002,16 +2707,19 @@ class SearchPicker(discord.ui.View):
         self.results = results
         self.message: discord.WebhookMessage | None = None
 
-        select = discord.ui.Select(
-            placeholder="Pick a song to play",
-            options=[
+        options = []
+        for i, result in enumerate(results):
+            description_bits = [b for b in (result.get("artist"), short_duration(result.get("duration"))) if b]
+            options.append(
                 discord.SelectOption(
-                    label=result["title"][:100],
-                    description=short_duration(result["duration"]) or None,
+                    label=(result.get("title") or "Unknown")[:100],
+                    description=truncate(" · ".join(description_bits), 100) or None,
                     value=str(i),
                 )
-                for i, result in enumerate(results)
-            ],
+            )
+        select = discord.ui.Select(
+            placeholder="Pick a song to play",
+            options=options,
         )
         select.callback = self.on_pick
         self.add_item(select)
