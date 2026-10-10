@@ -4075,7 +4075,24 @@ class Music(commands.Cog):
 
 
         await interaction.response.defer()
-        log.info("play: resolving %r", song)
+        log.info("play: connecting before resolving %r", song)
+
+        try:
+            _player, connect_error = await asyncio.wait_for(
+                self.ensure_player(interaction), timeout=30
+            )
+        except asyncio.TimeoutError:
+            log.warning("voice connect timed out before resolving %r", song)
+            await self._discard_voice(interaction.guild)
+            await interaction.followup.send(
+                "I took too long to join your voice channel. Try again."
+            )
+            return
+        if connect_error:
+            await interaction.followup.send(connect_error)
+            return
+
+        log.info("play: connected; resolving %r", song)
         started = time.monotonic()
 
         try:
