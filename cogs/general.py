@@ -1,5 +1,11 @@
+import platform
+import sys
+
 import discord
 from discord.ext import commands
+import yt_dlp
+
+import config
 
 
 class General(commands.Cog):
@@ -20,6 +26,25 @@ class General(commands.Cog):
             )
         )
 
+    @discord.app_commands.command(name="version", description="Show which build is running.")
+    async def version(self, interaction: discord.Interaction):
+        embed = discord.Embed(title="Audira build", colour=discord.Colour.blurple())
+        embed.add_field(name="Build", value=config.BUILD, inline=False)
+        embed.add_field(
+            name="Commit",
+            value=f"`{config.GIT_COMMIT[:12]}` on `{config.GIT_BRANCH}`",
+            inline=False,
+        )
+        embed.add_field(
+            name="Runtime",
+            value=(
+                f"Python {platform.python_version()} · discord.py {discord.__version__} · "
+                f"yt-dlp {yt_dlp.version.__version__}"
+            ),
+            inline=False,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     @discord.app_commands.command(name="help", description="Show all Audira commands.")
     async def help(self, interaction: discord.Interaction):
         embed = discord.Embed(
@@ -28,7 +53,7 @@ class General(commands.Cog):
         )
         embed.add_field(
             name="General",
-            value="`/ping` — check latency\n`/help` — show this list",
+            value="`/ping` — check latency\n`/help` — show this list\n`/version` — show the running build",
             inline=False,
         )
         embed.add_field(

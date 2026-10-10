@@ -65,6 +65,7 @@ async def load_cogs():
 @client.event
 async def on_ready():
     log.info("Audira is online as %s (ID: %s)", client.user, client.user.id)
+    log.info("build=%s commit=%s branch=%s", config.BUILD, config.GIT_COMMIT, config.GIT_BRANCH)
     log.info("connected to %s guild(s)", len(client.guilds))
     log.info("connected listeners: %s", len(client.extra_events))
 
