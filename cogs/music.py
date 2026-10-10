@@ -3991,28 +3991,27 @@ class Music(commands.Cog):
             voice = None
 
         if voice is None:
-            # Datacenter IPs (Render etc.) often need more than the library's
-            # default 30s for the voice handshake; one retry covers a first-attempt
-            # blip without leaving the user staring at a spinner.
-            last_exc: Exception | None = None
-            for attempt in range(2):
-                try:
-                    voice = await member.channel.connect(
-                        self_deaf=False, self_mute=False, timeout=60
-                    )
-                    last_exc = None
-                    break
-                except (asyncio.TimeoutError, OSError, discord.ClientException) as exc:
-                    last_exc = exc
-                    log.warning(
-                        "voice connect attempt %d failed: %s", attempt + 1, exc
-                    )
-                    await self._discard_voice(interaction.guild)
-            if last_exc is not None:
-                log.warning("voice connect failed after retry: %s", last_exc)
+            connect_started = time.monotonic()
+            try:
+                voice = await member.channel.connect(
+                    self_deaf=False, self_mute=False, timeout=20
+                )
+                log.info(
+                    "voice connected to %s in %.1fs",
+                    member.channel,
+                    time.monotonic() - connect_started,
+                )
+            except (asyncio.TimeoutError, OSError, discord.ClientException) as exc:
+                log.warning(
+                    "voice connect failed after %.1fs (%s): %r",
+                    time.monotonic() - connect_started,
+                    type(exc).__name__,
+                    exc,
+                )
+                await self._discard_voice(interaction.guild)
                 return None, (
-                    "I couldn't join your voice channel. Discord's voice servers "
-                    "can be slow from cloud hosts - try again in a few seconds."
+                    "I couldn't join your voice channel within 20 seconds. "
+                    "Check my Connect permission and try again."
                 )
         elif voice.channel != member.channel:
             try:
@@ -4139,7 +4138,7 @@ class Music(commands.Cog):
         """Connect, queue `track`, and reply. Caller must have deferred. Shared by /play and /search so both behave identically."""
         try:
             player, error = await asyncio.wait_for(
-                self.ensure_player(interaction), timeout=130
+                self.ensure_player(interaction), timeout=30
             )
         except asyncio.TimeoutError:
             log.warning("voice connect timed out for %r", label)
