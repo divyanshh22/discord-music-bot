@@ -422,6 +422,63 @@ class NormalizationTests(unittest.TestCase):
     def test_items_without_a_permalink_are_rejected(self):
         self.assertIsNone(m._normalize_song_item({"song": "No URL"}))
 
+    def test_v3_carries_artist_and_album_ids(self):
+        item = v3("Flashing Lights", "Kanye West", "Graduation", 237, "english",
+                  "https://www.jiosaavn.com/song/flashing-lights/BgwIWxgEU3s", "vdcjl4dH")
+        item["primary_artists_id"] = "527097, 564807"
+        item["albumid"] = "1945440"
+        candidate = m._normalize_song_item(item)
+        self.assertEqual(candidate["artist_ids"], ["527097", "564807"])
+        self.assertEqual(candidate["album_id"], "1945440")
+
+    def test_v4_artist_map_wins_over_v3_field(self):
+        item = v4("Khat", ["Navjot Ahuja"], "Khat", 296, "hindi",
+                  "https://www.jiosaavn.com/song/khat/A", "song-token", album_id="album-token")
+        item["primary_artists_id"] = "should-not-be-used"
+        candidate = m._normalize_song_item(item)
+        self.assertEqual(candidate["artist_ids"], ["navjot-ahuja-id"])
+
+
+class SongDetailTests(PatchedTestCase):
+    """Guards the two autoplay bugs: wrong token and a list response."""
+
+    def test_raw_song_id_returns_a_list_and_is_handled(self):
+        # webapi.get answers the short id with [] rather than a dict.
+        self.patch(_saavn_get=lambda *a, **k: [])
+        self.assertIsNone(m._saavn_song_detail("vdcjl4dH"))
+
+    def test_perma_token_detail_is_normalized(self):
+        payload = {
+            "songs": [
+                v4("Flashing Lights", ["Kanye West"], "Graduation", 237, "english",
+                   "https://www.jiosaavn.com/song/flashing-lights/BgwIWxgEU3s",
+                   "vdcjl4dH", album_id="1945440")
+            ]
+        }
+        self.patch(_saavn_get=lambda *a, **k: payload)
+        detail = m._saavn_song_detail("BgwIWxgEU3s")
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["artist_ids"], ["kanye-west-id"])
+        self.assertEqual(detail["album_id"], "1945440")
+
+    def test_resolve_song_detail_prefers_the_perma_token(self):
+        seen: list[str] = []
+
+        def fake_detail(token):
+            seen.append(token)
+            return {"id": "vdcjl4dH", "artist_ids": ["527097"]} if token == "BgwIWxgEU3s" else None
+
+        self.patch(_saavn_song_detail=fake_detail)
+        track = m.Track(
+            source="x",
+            title="Flashing Lights",
+            song_id="vdcjl4dH",
+            webpage_url="https://www.jiosaavn.com/song/flashing-lights/BgwIWxgEU3s",
+        )
+        detail = m._resolve_song_detail(track)
+        self.assertEqual(detail["artist_ids"], ["527097"])
+        self.assertEqual(seen[0], "BgwIWxgEU3s", "the perma-url token must be tried first")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

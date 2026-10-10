@@ -514,6 +514,11 @@ def _normalize_song_item(item: dict) -> dict | None:
         for a in (artist_map.get("primary_artists") or [])
         if a.get("id")
     ]
+    if not artist_ids:
+        # v3 search objects expose the artist ids as a comma-separated string.
+        raw_ids = item.get("primary_artists_id")
+        if isinstance(raw_ids, str):
+            artist_ids = [part.strip() for part in raw_ids.split(",") if part.strip()]
 
     artist = (item.get("primary_artists") or "").strip()
     if not artist and primary:
@@ -539,6 +544,7 @@ def _normalize_song_item(item: dict) -> dict | None:
         duration = None
 
     song_id = item.get("id") or _jiosaavn_song_id(page)
+    album_id = more.get("album_id") or item.get("albumid") or item.get("album_id")
 
     return {
         "id": str(song_id) if song_id else None,
@@ -546,7 +552,7 @@ def _normalize_song_item(item: dict) -> dict | None:
         "artist": artist,
         "artist_ids": artist_ids,
         "album": album,
-        "album_id": str(more.get("album_id")) if more.get("album_id") else None,
+        "album_id": str(album_id) if album_id else None,
         "duration": duration or None,
         "language": (item.get("language") or more.get("language") or None),
         "year": (item.get("year") or more.get("year") or None),
@@ -1544,7 +1550,12 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 
 def _saavn_song_detail(song_token: str) -> dict | None:
-    """Rich metadata for one song (artist ids, album, language...)."""
+    """Rich metadata for one song (artist ids, album, language...).
+
+    `token` must be the perma-url token (the last path segment of the song URL);
+    the short song id is *not* accepted by webapi.get and comes back as an empty
+    list, so a non-dict response is treated as "not found".
+    """
     if not song_token:
         return None
     key = ("song", song_token)
@@ -1560,7 +1571,7 @@ def _saavn_song_detail(song_token: str) -> dict | None:
     except Exception as exc:  # noqa: BLE001
         log.info("jiosaavn song detail failed for %s: %s", song_token, reason_line(exc))
         return None
-    songs = data.get("songs") or []
+    songs = data.get("songs") if isinstance(data, dict) else None
     detail = _normalize_song_item(songs[0]) if songs else None
     if detail:
         _DETAIL_CACHE.set(key, detail)
@@ -1674,9 +1685,14 @@ def _saavn_reco(song_id: str | None, language: str | None, limit: int = 12) -> l
 
 
 def _resolve_song_detail(finished: Track) -> dict | None:
-    """Identify the finished track on JioSaavn, using its link or a title search."""
-    token = finished.song_id or _jiosaavn_song_id(finished.webpage_url)
-    if token:
+    """Identify the finished track on JioSaavn, using its link or a title search.
+
+    `webapi.get` needs the perma-url token, so the link-derived token is tried
+    before the stored (short) song id.
+    """
+    for token in (_jiosaavn_song_id(finished.webpage_url), finished.song_id):
+        if not token:
+            continue
         detail = _saavn_song_detail(token)
         if detail:
             return detail
