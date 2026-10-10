@@ -3084,6 +3084,37 @@ class PlayerView(discord.ui.View):
         self.queue_btn.disabled = not (active or player.queue)
         self.lyrics_btn.disabled = not active
 
+    async def _dm_like(
+        self,
+        interaction: discord.Interaction,
+        track: Track,
+        liked: bool,
+        count: int,
+    ) -> bool:
+        """DM the liker a private confirmation card. False when DMs are closed."""
+        embed = discord.Embed(
+            title="❤️ Saved to your likes" if liked else "🤍 Removed from your likes",
+            colour=TANGO_BLUE,
+        )
+        embed.set_author(name=f"🎵 {BRAND_NAME}", icon_url=BRAND_ICON)
+        bits = [f"**{truncate(track.title, 120)}**"]
+        if track.artist:
+            bits.append(truncate(track.artist, 60))
+        if track.duration:
+            bits.append(format_time(track.duration))
+        embed.description = "\n".join(bits)
+        if track.thumbnail:
+            embed.set_thumbnail(url=track.thumbnail)
+        embed.set_footer(
+            text=f"{BRAND_NAME} · {count} liked track{'s' if count != 1 else ''}",
+            icon_url=BRAND_ICON,
+        )
+        try:
+            await interaction.user.send(embed=embed)
+            return True
+        except discord.HTTPException:
+            return False
+
     async def _edit_card(self, interaction: discord.Interaction) -> None:
         """Re-render the card in place as the answer to a button press."""
         self.sync()
@@ -3259,14 +3290,17 @@ class PlayerView(discord.ui.View):
             if not users:
                 player.liked.pop(identity, None)
         await self._edit_card(interaction)
-        if liked:
-            await interaction.followup.send(
-                f"❤️ Added **{truncate(track.title, 60)}** to your likes.", ephemeral=True
+        count = sum(
+            1 for users in player.liked.values() if interaction.user.id in users
+        )
+        dm_sent = await self._dm_like(interaction, track, liked, count)
+        if not dm_sent:
+            text = (
+                f"❤️ Added **{truncate(track.title, 60)}** to your likes."
+                if liked
+                else f"🤍 Removed **{truncate(track.title, 60)}** from your likes."
             )
-        else:
-            await interaction.followup.send(
-                f"🤍 Removed **{truncate(track.title, 60)}** from your likes.", ephemeral=True
-            )
+            await interaction.followup.send(text, ephemeral=True)
         guild = interaction.guild
         if guild is not None:
             if liked:
@@ -3519,6 +3553,28 @@ class LikesView(discord.ui.View):
         await interaction.response.edit_message(
             embed=self._refresh_embed(),
             view=self,
+        )
+
+    @discord.ui.button(emoji="📩", label="DM list", style=discord.ButtonStyle.secondary, row=2)
+    async def dm_list(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.entries:
+            await interaction.response.send_message(
+                "Your liked list is empty.", ephemeral=True
+            )
+            return
+        embed = build_likes_embed(self.entries[:25])
+        embed.set_footer(
+            text=f"{BRAND_NAME} · Sent to your DMs", icon_url=BRAND_ICON
+        )
+        try:
+            await interaction.user.send(embed=embed)
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "I can't DM you — please allow DMs from this server.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            "📩 Sent your liked tracks to your DMs.", ephemeral=True
         )
 
     @discord.ui.button(emoji="▶️", label="Play all", style=discord.ButtonStyle.secondary, row=2)
