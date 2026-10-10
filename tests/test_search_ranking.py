@@ -13,6 +13,7 @@ import asyncio
 import os
 import pathlib
 import sys
+import types
 import unittest
 
 os.environ.setdefault("DISCORD_TOKEN", "test-token")
@@ -99,9 +100,30 @@ KHAT_BROAD = norm(
 )
 
 
+THOSE_EYES = norm(
+    # Deliberately lists the wrong recordings first: a karaoke instrumental and
+    # a jazz cover. The real New West single must still win.
+    v3("Those Eyes (Instrumental)", "Karaoke Kings", "Karaoke Hits", 220, "english",
+       "https://www.jiosaavn.com/song/those-eyes-instrumental/A", "wrong-instrumental"),
+    v3("Those Eyes", "Jazz Trio", "Jazz Covers", 220, "english",
+       "https://www.jiosaavn.com/song/those-eyes/B", "wrong-jazz"),
+    v3("Those Eyes (Official Audio)", "New West", "Those Eyes", 220, "english",
+       "https://www.jiosaavn.com/song/those-eyes-official/C", "right-official"),
+    v3("Those Eyes", "New West", "Those Eyes", 220, "english",
+       "https://www.jiosaavn.com/song/those-eyes/D", "right-newwest"),
+)
+
+
 def fake_flashing_search(query, limit=None):
     if "flashing" in query.lower():
         return [dict(c) for c in FLASHING_LIGHTS][: (limit or 5)]
+    return []
+
+
+def fake_those_eyes_search(query, limit=None):
+    ql = query.lower()
+    if "those" in ql and "eyes" in ql:
+        return [dict(c) for c in THOSE_EYES][: (limit or 5)]
     return []
 
 
@@ -210,6 +232,65 @@ class RelaxationTests(PatchedTestCase):
         self.assertEqual(results[0]["artist"], "Navjot Ahuja")
 
 
+# --- Exact song search ("Those Eyes by New West") ------------------------
+
+
+class SearchAccuracyTests(PatchedTestCase):
+    def setUp(self):
+        super().setUp()
+        self.patch(search_jiosaavn=fake_those_eyes_search)
+
+    def by_id(self, results):
+        return {c["id"]: c for c in results}
+
+    def test_title_by_artist_selects_the_correct_track(self):
+        results = m.search_candidates("Those Eyes by New West", m.MAX_POOL)
+        self.assertTrue(results)
+        self.assertEqual(results[0]["artist"], "New West")
+        self.assertTrue(results[0]["title"].startswith("Those Eyes"))
+        self.assertEqual(results[0]["signals"]["title_similarity"], 1.0)
+        self.assertFalse(results[0]["signals"]["artist_mismatch"])
+
+    def test_unrelated_first_result_is_not_selected(self):
+        results = m.search_candidates("Those Eyes by New West", m.MAX_POOL)
+        self.assertEqual(results[0]["artist"], "New West")
+        candidates = self.by_id(results)
+        self.assertTrue(candidates["wrong-instrumental"]["signals"]["artist_mismatch"])
+        self.assertLess(candidates["wrong-instrumental"]["score"], results[0]["score"])
+        self.assertLess(candidates["wrong-jazz"]["score"], results[0]["score"])
+
+    def test_slightly_different_title_format_still_matches(self):
+        results = m.search_candidates("Those Eyes by New West", m.MAX_POOL)
+        candidates = self.by_id(results)
+        official = candidates["right-official"]
+        self.assertEqual(official["signals"]["title_similarity"], 1.0)
+        self.assertFalse(official["signals"]["artist_mismatch"])
+        self.assertGreaterEqual(official["score"], m.CONFIDENCE_HIGH)
+
+    def test_query_parses_title_and_artist(self):
+        spec = m._parse_query("Those Eyes by New West")
+        self.assertEqual(spec["title"], "Those Eyes")
+        self.assertEqual(spec["artist"], "New West")
+        self.assertEqual(spec["core"], "those eyes")
+        self.assertEqual(spec["separator"], "by")
+
+    def test_dash_format_is_recognised_both_ways(self):
+        spec = m._parse_query("New West - Those Eyes")
+        self.assertEqual(spec["separator"], "-")
+        self.assertIn("those", spec["tokens"])
+        self.assertIn("west", spec["tokens"])
+
+    def test_by_inside_a_title_is_not_split(self):
+        # "Stand By Me" is a title, not "Stand" by "Me".
+        spec = m._parse_query("Stand By Me")
+        self.assertIsNone(spec["title"])
+        self.assertIsNone(spec["artist"])
+
+    def test_upload_suffixes_are_ignored(self):
+        spec = m._parse_query("Those Eyes (Official Audio)")
+        self.assertEqual(spec["core"], "those eyes")
+
+
 # --- resolve_track confidence gate (async) -------------------------------
 
 
@@ -272,6 +353,47 @@ class ResolveTrackTests(PatchedTestCase):
             ["https://www.jiosaavn.com/song/first/F", "https://www.jiosaavn.com/song/second/S"],
         )
         self.assertEqual(track.song_id, "second")
+
+    def test_ambiguous_result_offers_choices(self):
+        self.patch(search_candidates=lambda q, limit=5: [
+            {"id": "a", "title": "Those Eyes", "artist": "New West",
+             "webpage_url": "https://www.jiosaavn.com/song/x/a",
+             "score": 0.5, "signals": {"artist_hint": False, "artist_mismatch": False}},
+            {"id": "b", "title": "Those Eyes", "artist": "Jazz Trio",
+             "webpage_url": "https://www.jiosaavn.com/song/x/b",
+             "score": 0.45, "signals": {"artist_hint": False, "artist_mismatch": False}},
+        ])
+        with self.assertRaises(m.AmbiguousMatch) as ctx:
+            self.run_resolve("Those Eyes")
+        self.assertEqual([c["id"] for c in ctx.exception.candidates], ["a", "b"])
+        self.assertEqual(self.extracted, [], "nothing may stream before the user picks")
+
+    def test_confident_match_is_not_ambiguous(self):
+        self.patch(search_candidates=lambda q, limit=5: [
+            {"id": "a", "title": "Those Eyes", "artist": "New West",
+             "webpage_url": "https://www.jiosaavn.com/song/x/S",
+             "score": 0.9, "signals": {"artist_hint": True, "artist_mismatch": False}},
+        ])
+        track = self.run_resolve("Those Eyes by New West")
+        self.assertEqual(track.song_id, "a")
+
+    def test_track_found_but_unstreamable_is_a_stream_error(self):
+        self.patch(search_candidates=lambda q, limit=5: [
+            {"id": "a", "title": "Those Eyes", "artist": "New West",
+             "webpage_url": "https://www.jiosaavn.com/song/x/F",
+             "score": 0.9, "signals": {"artist_hint": False, "artist_mismatch": False}},
+        ])
+        with self.assertRaises(m.StreamResolveError):
+            self.run_resolve("Those Eyes New West")
+
+    def test_resolved_track_keeps_the_requested_query(self):
+        self.patch(search_candidates=lambda q, limit=5: [
+            {"id": "a", "title": "Those Eyes", "artist": "New West",
+             "webpage_url": "https://www.jiosaavn.com/song/x/S",
+             "score": 0.9, "signals": {"artist_hint": False, "artist_mismatch": False}},
+        ])
+        track = self.run_resolve("Those Eyes by New West")
+        self.assertEqual(track.requested_query, "Those Eyes by New West")
 
 
 # --- Autoplay recommendations --------------------------------------------
@@ -352,17 +474,166 @@ class AutoplayTests(PatchedTestCase):
         ids = [c["id"] for _, c in ranked]
         self.assertNotIn("homecoming", ids)
 
-    def test_no_title_keyword_fallback(self):
-        # Even if every relationship source is empty, autoplay must not fall back
-        # to matching the title words of the finished track.
+    def _empty_rails(self):
         self.patch(
             _saavn_reco=lambda song_id, language, limit=12: [],
             _saavn_artist_other_top_songs=lambda *a, **k: [],
             _saavn_album_tracks=lambda *a, **k: [],
             _saavn_similar_artists=lambda artist_id: [],
         )
+
+    def test_empty_rails_fall_back_to_an_artist_search(self):
+        self._empty_rails()
+        calls: list[str] = []
+
+        def fake_search(query, limit=None):
+            calls.append(query)
+            return [
+                make_candidate("Stronger", "Kanye West", "stronger"),
+                make_candidate("Unrelated Song", "Some Other Band", "unrelated"),
+            ]
+
+        self.patch(search_jiosaavn=fake_search)
         weighted = m.MusicPlayer._autoplay_candidates(None, self.finished)
-        self.assertEqual(weighted, [])
+        ids = [c["id"] for _, c in weighted]
+        self.assertIn("stronger", ids, "same-artist songs should be surfaced")
+        self.assertNotIn("unrelated", ids, "the fallback must stay on the same artist")
+        self.assertTrue(calls, "the artist must be searched")
+        self.assertNotIn(self.finished.title.lower(), calls[0].lower())
+
+    def test_fallback_is_skipped_when_rails_return_tracks(self):
+        # The default rails already return tracks, so no artist search happens.
+        self.patch(
+            search_jiosaavn=lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("broad search should not run")
+            )
+        )
+        weighted = m.MusicPlayer._autoplay_candidates(None, self.finished)
+        self.assertTrue(weighted)
+
+
+# --- Autoplay pipeline (queue insertion / retries) -----------------------
+
+
+class FakeVoice:
+    """The tiny slice of discord.VoiceProtocol that MusicPlayer touches."""
+
+    def __init__(self):
+        self.channel = None
+        self.guild = types.SimpleNamespace(id=1)
+        self.connected = True
+
+    def is_connected(self):
+        return self.connected
+
+
+def make_player(**overrides):
+    player = m.MusicPlayer(FakeVoice())
+    for name, value in overrides.items():
+        setattr(player, name, value)
+    return player
+
+
+class AutoplayPipelineTests(PatchedTestCase):
+    def setUp(self):
+        super().setUp()
+        self.finished = m.Track(
+            source="x",
+            title="Flashing Lights",
+            artist="Kanye West",
+            requested_by="tester",
+            song_id="vdcjl4dH",
+            webpage_url="https://www.jiosaavn.com/song/flashing-lights/vdcjl4dH",
+            language="english",
+        )
+        self.candidate = make_candidate("Stronger", "Kanye West", "stronger")
+
+    def run_autoplay(self, player):
+        asyncio.run(player._queue_autoplay(self.finished))
+
+    def resolved(self, title="Stronger", song_id="stronger"):
+        return m.Track(
+            source="s", title=title, requested_by="tester", song_id=song_id,
+        )
+
+    def test_related_track_is_queued(self):
+        player = make_player(autoplay=True)
+        player._autoplay_candidates = lambda finished: [(0.9, self.candidate)]
+
+        async def fake_first(ranked, finished):
+            return self.resolved(), None
+
+        player._first_related = fake_first
+        self.run_autoplay(player)
+        self.assertEqual([t.title for t in player.queue], ["Stronger"])
+
+    def test_empty_recommendations_do_not_queue_or_crash(self):
+        player = make_player(autoplay=True)
+        player._autoplay_candidates = lambda finished: []
+
+        async def fake_first(ranked, finished):
+            return (None, None)
+
+        player._first_related = fake_first
+        self.run_autoplay(player)
+        self.assertEqual(player.queue, [])
+        self.assertFalse(player._autoplay_busy)
+
+    def test_provider_error_does_not_disable_autoplay(self):
+        player = make_player(autoplay=True)
+
+        def boom(finished):
+            raise RuntimeError("jiosaavn exploded")
+
+        player._autoplay_candidates = boom
+
+        async def fake_first(ranked, finished):
+            return (None, None)
+
+        player._first_related = fake_first
+        self.run_autoplay(player)  # must not raise
+        self.assertTrue(player.autoplay)
+        self.assertFalse(player._autoplay_busy)
+        self.assertEqual(player.queue, [])
+
+        # A later, healthy lookup still works.
+        player._autoplay_candidates = lambda finished: [(0.9, self.candidate)]
+
+        async def ok_first(ranked, finished):
+            return self.resolved(), None
+
+        player._first_related = ok_first
+        self.run_autoplay(player)
+        self.assertEqual(len(player.queue), 1)
+
+    def test_disabled_autoplay_never_inserts(self):
+        player = make_player(autoplay=False)
+        called: list[bool] = []
+        player._autoplay_candidates = lambda finished: called.append(True) or []
+        self.run_autoplay(player)
+        self.assertEqual(player.queue, [])
+        self.assertEqual(called, [])
+
+    def test_empty_queue_and_failed_search_terminate(self):
+        player = make_player(autoplay=True)
+        player._autoplay_candidates = lambda finished: []
+
+        async def fake_first(ranked, finished):
+            return (None, None)
+
+        player._first_related = fake_first
+        player.queue.append(self.finished)
+
+        async def fake_play_one(track):
+            return True
+
+        player._play_one = fake_play_one
+
+        async def run():
+            await asyncio.wait_for(player._run(), timeout=5)
+
+        asyncio.run(run())  # finishing within the timeout proves it does not spin
+        self.assertEqual(player.queue, [])
 
 
 class IdentityTests(unittest.TestCase):

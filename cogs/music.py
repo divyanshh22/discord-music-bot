@@ -623,6 +623,17 @@ _STOPWORDS = {
 }
 _BRACKETS = re.compile(r"[\(\[]([^\)\]]*)[\)\]]")
 
+# Harmless upload/edition suffixes that providers bolt onto titles. They are
+# stripped only when they trail the title (a song literally called "Video Games"
+# keeps its "Video"), so a plain request is compared against the real title.
+_SUFFIX_NOISE = re.compile(
+    r"(?:\s*[-–—|:]\s*)?"
+    r"\b(?:official\s+(?:music\s+)?video|official\s+audio|official\s+lyric\s+video|"
+    r"lyric\s+video|lyrics?|audio|video|topic|full\s+song|full\s+video|hd|4k|"
+    r"visuali[sz]er)\b\s*$",
+    re.I,
+)
+
 
 def _strip_accents(text: str) -> str:
     return _ACCENT.sub("", unicodedata.normalize("NFKD", text or ""))
@@ -658,6 +669,13 @@ def _title_core(text: str) -> str:
     """The main title with edition tags and 'feat.' credits removed."""
     text = _BRACKETS.sub(" ", text or "")
     text = re.sub(r"\b(feat|ft|featuring|with)\b\.?.*$", " ", text, flags=re.I)
+    # Strip trailing noise, repeating so stacked tags ("Song - Official Audio")
+    # are all removed.
+    while True:
+        stripped = _SUFFIX_NOISE.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
     words = [
         w
         for w in _norm_text(text).split()
@@ -666,13 +684,49 @@ def _title_core(text: str) -> str:
     return " ".join(words).strip()
 
 
+def _split_explicit(query: str) -> tuple[str | None, str | None, str | None]:
+    """Recognise "title by artist" and "a - b" request shapes.
+
+    "by" is a hard title/artist separator only when the left side looks like a
+    real title (two or more words), so songs such as "Stand By Me" stay intact.
+    " - " is reported as an ambiguous separator: the two sides are searched in
+    both roles because "artist - title" and "title - artist" are both common.
+    """
+    text = (query or "").strip()
+    match = re.search(r"\s+by\s+", text, flags=re.I)
+    if match:
+        left = text[: match.start()].strip()
+        right = text[match.end():].strip()
+        if left and right and len(left.split()) >= 2:
+            return left, right, "by"
+    if " - " in text:
+        left, right = (part.strip() for part in text.split(" - ", 1))
+        if left and right:
+            return None, None, "-"
+    return None, None, None
+
+
 def _parse_query(query: str) -> dict:
-    core = _title_core(query)
+    """Split a request into its title/artist parts and matching signals.
+
+    `core` is the title to compare against results (artist words are excluded
+    from it when the user wrote "title by artist"), while `tokens` keeps every
+    meaningful word so an artist named after the title can still be detected.
+    """
+    raw = (query or "").strip()
+    title, artist, separator = _split_explicit(raw)
+    core = _title_core(title or raw)
+    tokens = _content_tokens(core)
+    if artist:
+        tokens |= _content_tokens(artist)
     return {
-        "raw": query,
+        "raw": raw,
+        "title": title,
+        "artist": artist,
+        "separator": separator,
         "core": core,
-        "version": _version_tags(query),
-        "tokens": _content_tokens(core),
+        "version": _version_tags(raw),
+        "tokens": tokens,
     }
 
 
@@ -692,13 +746,18 @@ def _search_queries(query: str, spec: dict) -> list[str]:
             ordered.append(value)
 
     add(query)
+    # The clean title ("Those Eyes") often beats the raw request when the raw
+    # request carries an artist or suffix noise.
+    add(spec.get("title") or "")
     core = spec.get("core") or ""
     add(core)
     words = core.split()
     for size in range(len(words) - 1, 0, -1):
         add(" ".join(words[:size]))
-    if " - " in query:
-        add(query.split(" - ", 1)[0])
+    if spec.get("separator") == "-":
+        # Try both "artist - title" and "title - artist" orderings.
+        for part in query.split(" - ", 1):
+            add(part.strip())
     return ordered
 
 
@@ -937,12 +996,16 @@ class Track:
         song_id: str | None = None,
         album: str | None = None,
         language: str | None = None,
+        requested_query: str | None = None,
     ):
         self.source = source
         self.title = title
         self.requested_by = requested_by
         self.duration = duration
         self.webpage_url = webpage_url
+
+        # What the user actually typed, kept separate from the provider metadata.
+        self.requested_query = requested_query
 
 
         self.headers = headers or {}
@@ -1311,6 +1374,7 @@ def _cut_track(track: Track, seconds: int) -> Track | None:
         song_id=track.song_id,
         album=track.album,
         language=track.language,
+        requested_query=track.requested_query,
     )
 
 
@@ -1412,6 +1476,27 @@ CONFIDENCE_MEDIUM = 0.40
 CONFIDENCE_MARGIN = 0.15
 
 
+class AmbiguousMatch(LookupError):
+    """The best result is plausible but not certain, so the caller offers choices.
+
+    Carries the ranked alternatives so a command can show a picker instead of
+    silently playing something the user did not ask for.
+    """
+
+    def __init__(self, query: str, candidates: list[dict]):
+        self.query = query
+        self.candidates = candidates
+        super().__init__(f"multiple plausible matches for {query!r}")
+
+
+class StreamResolveError(LookupError):
+    """A plausible JioSaavn track was found but its audio stream failed to resolve.
+
+    Distinct from a search failure so the reply can say the track exists but
+    wouldn't play, rather than claiming nothing was found.
+    """
+
+
 async def resolve_track(query: str, requested_by: str) -> Track:
     """Resolve local files or JioSaavn tracks; never stream from other platforms."""
     query = query.strip()
@@ -1424,7 +1509,9 @@ async def resolve_track(query: str, requested_by: str) -> Track:
 
     path = find_song(query)
     if path is not None:
-        return Track.from_file(path, requested_by)
+        track = Track.from_file(path, requested_by)
+        track.requested_query = query
+        return track
 
     if is_url(query):
         host = urlparse(query).netloc.lower().split(":")[0].replace("www.", "")
@@ -1435,10 +1522,14 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         try:
             info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, query)
         except Exception as exc:
-            raise LookupError(reason_line(exc)) from exc
+            raise StreamResolveError(
+                f"I reached JioSaavn but couldn't load that link: {reason_line(exc)}"
+            ) from exc
         if not info:
-            raise LookupError("JioSaavn returned no playable track")
-        return _build_track(info, query, requested_by)
+            raise StreamResolveError("JioSaavn returned no playable track for that link.")
+        track = _build_track(info, query, requested_by)
+        track.requested_query = query
+        return track
 
     last_error: Exception | None = None
     try:
@@ -1454,10 +1545,29 @@ async def resolve_track(query: str, requested_by: str) -> Track:
     if not candidates:
         raise LookupError("no results")
 
-    best_score = float(candidates[0].get("score") or 0.0)
-    best_signals = candidates[0].get("signals") or {}
+    best = candidates[0]
+    best_score = float(best.get("score") or 0.0)
+    best_signals = best.get("signals") or {}
+
+    # Alternatives the user could sensibly pick: close enough to be plausible and
+    # not a known artist mismatch.
+    alternatives = [
+        candidate
+        for candidate in candidates
+        if float(candidate.get("score") or 0.0) >= CONFIDENCE_MEDIUM
+        and not (candidate.get("signals") or {}).get("artist_mismatch")
+    ][:MAX_RESULTS]
 
     if best_signals.get("artist_hint") and best_signals.get("artist_mismatch"):
+        # The closest hit is a different artist. Offer the correct-artist options
+        # if any exist, otherwise admit the requested artist wasn't found.
+        if alternatives:
+            log.info(
+                "resolving %r: best hit is a different artist, offering %d choice(s)",
+                query,
+                len(alternatives),
+            )
+            raise AmbiguousMatch(query, alternatives)
         raise LookupError(
             f"I couldn't find **{query}** by that artist on JioSaavn. "
             "Check the spelling or try a different search."
@@ -1469,14 +1579,26 @@ async def resolve_track(query: str, requested_by: str) -> Track:
             "Try adding the artist name or a more specific title."
         )
 
+    # Plausible but not certain: let the user pick instead of guessing.
+    if best_score < CONFIDENCE_HIGH and alternatives:
+        log.info(
+            "resolving %r: ambiguous (best=%.2f), offering %d choice(s)",
+            query,
+            best_score,
+            len(alternatives),
+        )
+        raise AmbiguousMatch(query, alternatives)
+
     artist_required = bool(best_signals.get("artist_hint"))
     threshold = max(CONFIDENCE_MEDIUM, best_score - CONFIDENCE_MARGIN)
     log.info(
-        "resolving %r: best=%.2f (%r by %r)",
+        "resolving %r: selected %r by %r (score=%.2f, exact_title=%s, artist_sim=%.2f)",
         query,
+        best.get("title"),
+        best.get("artist"),
         best_score,
-        candidates[0].get("title"),
-        candidates[0].get("artist"),
+        bool(best_signals.get("exact_title")),
+        float(best_signals.get("artist_similarity") or 0.0),
     )
 
     for candidate in candidates:
@@ -1492,14 +1614,23 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         try:
             info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, url)
             if info:
-                return _build_track(info, query, requested_by, candidate=candidate)
+                track = _build_track(info, query, requested_by, candidate=candidate)
+                track.requested_query = query
+                return track
         except Exception as exc:
             last_error = exc
             log.warning("JioSaavn candidate resolve failed for %r: %s", url, reason_line(exc))
 
+    # A track existed on JioSaavn but we couldn't get audio for it - that is a
+    # stream failure, not a search failure.
     if last_error is not None:
-        raise LookupError(reason_line(last_error)) from last_error
-    raise LookupError("no playable result")
+        raise StreamResolveError(
+            f"I found **{best.get('title') or query}** on JioSaavn but couldn't "
+            f"load its audio: {reason_line(last_error)}"
+        ) from last_error
+    raise StreamResolveError(
+        f"I found results for **{query}** on JioSaavn but none of them were playable."
+    )
 
 
 def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
@@ -1523,13 +1654,24 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
     ranked = rank_candidates(pool, spec)
     log.info(
-        "JioSaavn search %r: %d candidate(s), best=%.2f %r by %r",
+        "JioSaavn search %r: provider=jiosaavn, %d candidate(s), best=%.2f %r by %r",
         query,
         len(pool),
         ranked[0][0],
         ranked[0][1].get("title"),
         ranked[0][1].get("artist"),
     )
+    if log.isEnabledFor(logging.DEBUG):
+        for score, candidate, signals in ranked[:limit]:
+            log.debug(
+                "  candidate %.3f %r by %r (title=%.2f artist=%.2f%s)",
+                score,
+                candidate.get("title"),
+                candidate.get("artist"),
+                signals.get("title_similarity", 0.0),
+                signals.get("artist_similarity", 0.0),
+                ", mismatch" if signals.get("artist_mismatch") else "",
+            )
 
     results: list[dict] = []
     for score, candidate, signals in ranked[:limit]:
@@ -1682,6 +1824,34 @@ def _saavn_reco(song_id: str | None, language: str | None, limit: int = 12) -> l
             results.append(candidate)
     _DETAIL_CACHE.set(key, results)
     return results
+
+
+# Weight for the last-resort autoplay source. Lower than any relationship rail
+# (reco/same-artist/album/similar-artist) so it only wins when those are empty.
+BROAD_SEARCH_WEIGHT = 0.55
+
+
+def _same_artist(a: str | None, b: str | None) -> bool:
+    """True when two artist strings share a meaningful word ("New West" ~ "New West")."""
+    return bool(_content_tokens(a or "") & _content_tokens(b or ""))
+
+
+def _saavn_broad_search(finished: Track, detail: dict | None, limit: int = SEARCH_EARLY_STOP) -> list[dict]:
+    """Last-resort autoplay: more songs by the same artist.
+
+    Used only when JioSaavn's relationship rails (reco / same-artist / album /
+    similar-artist) return nothing. Results are filtered to the same artist, so a
+    degraded lookup can never drift into a random or unrelated track.
+    """
+    artist = (finished.artist or (detail or {}).get("artist") or "").strip()
+    if not artist:
+        return []
+    try:
+        found = search_jiosaavn(artist, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        log.info("autoplay broad search failed for %r: %s", artist, reason_line(exc))
+        return []
+    return [candidate for candidate in found if _same_artist(candidate.get("artist"), artist)]
 
 
 def _resolve_song_detail(finished: Track) -> dict | None:
@@ -2179,10 +2349,23 @@ class MusicPlayer:
                 ]
             add(0.70, related)
 
+        # 5. Last resort: no relationship rails produced anything, so search the
+        # artist's catalogue directly. Filtered to the same artist above.
+        if not weighted:
+            broad = _saavn_broad_search(finished, detail)
+            if broad:
+                log.info(
+                    "autoplay: relationship rails empty for %r, broad artist search gave %d track(s)",
+                    finished.title,
+                    len(broad),
+                )
+            add(BROAD_SEARCH_WEIGHT, broad)
+
         log.info(
-            "autoplay: %d related track(s) discovered for %r",
+            "autoplay: %d weighted candidate(s) for %r (detail=%s)",
             len(weighted),
             finished.title,
+            "yes" if detail else "no",
         )
         return weighted
 
@@ -2214,24 +2397,32 @@ class MusicPlayer:
 
     async def _first_related(
         self, ranked: list[tuple[float, dict]], finished: Track
-    ) -> Track | None:
-        """Resolve the strongest related candidate that actually streams."""
+    ) -> tuple[Track | None, Exception | None]:
+        """Resolve the strongest related candidate that actually streams.
+
+        Returns the playable Track (or None) plus the last stream error, so a
+        total failure can be logged with its real reason instead of a generic
+        "nothing similar" message.
+        """
+        last_error: Exception | None = None
         for _score, candidate in ranked:
             url = candidate.get("webpage_url")
             if not url:
                 continue
             try:
-                return await asyncio.wait_for(
+                track = await asyncio.wait_for(
                     resolve_track(url, finished.requested_by), timeout=60
                 )
+                return track, None
             except Exception as exc:  # noqa: BLE001 - try the next candidate
+                last_error = exc
                 log.warning(
                     "autoplay could not resolve %r: %s",
                     candidate.get("title"),
                     reason_line(exc),
                 )
                 continue
-        return None
+        return None, last_error
 
     async def _queue_autoplay(self, finished: Track) -> None:
         """Keep the music going with a genuinely related JioSaavn track."""
@@ -2254,24 +2445,36 @@ class MusicPlayer:
                 weighted = await asyncio.wait_for(
                     asyncio.to_thread(self._autoplay_candidates, finished), timeout=45
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - report the real reason
                 log.warning(
                     "autoplay lookup failed for %r: %s",
                     finished.title,
-                    type(exc).__name__,
+                    reason_line(exc),
                 )
                 weighted = []
 
             ranked = self._rank_autoplay(weighted, finished)
+            log.info(
+                "autoplay: %d candidate(s) related to %r after filtering",
+                len(ranked),
+                finished.title,
+            )
 
             # A listener may have queued something while we were fetching.
             if self.queue or not self.autoplay or not self.voice.is_connected():
                 return
 
-            track = await self._first_related(ranked, finished)
+            track, stream_error = await self._first_related(ranked, finished)
             if track is None:
-                log.info("autoplay found nothing related to play")
-                self._notify("Autoplay couldn't find anything similar to play.")
+                if stream_error is not None:
+                    log.warning(
+                        "autoplay: related tracks found but none streamed for %r: %s",
+                        finished.title,
+                        reason_line(stream_error),
+                    )
+                else:
+                    log.info("autoplay: no related track available for %r", finished.title)
+                self._notify("Autoplay couldn't find a similar song to play right now.")
                 return
 
             # Re-check after the (awaited) resolution: manual queues win.
@@ -2984,6 +3187,20 @@ class Music(commands.Cog):
             await interaction.followup.send(
                 "That took too long to load. Try a direct link or a shorter search."
             )
+            return
+        except AmbiguousMatch as exc:
+            # Not confident enough to auto-pick: let the user choose.
+            log.info("play: %r is ambiguous, showing %d choice(s)", song, len(exc.candidates))
+            picker = SearchPicker(self, exc.candidates)
+            picker.message = await interaction.followup.send(
+                f"I found a few possible matches for **{song}** - pick the one you meant:",
+                view=picker,
+                wait=True,
+            )
+            return
+        except StreamResolveError as exc:
+            log.warning("stream failed for %r: %s", song, exc)
+            await interaction.followup.send(str(exc))
             return
         except ValueError as exc:
 
