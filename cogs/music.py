@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -546,6 +547,12 @@ def _normalize_song_item(item: dict) -> dict | None:
     song_id = item.get("id") or _jiosaavn_song_id(page)
     album_id = more.get("album_id") or item.get("albumid") or item.get("album_id")
 
+    raw_play_count = item.get("play_count") or more.get("play_count")
+    try:
+        play_count = int(raw_play_count) if raw_play_count not in (None, "") else 0
+    except (TypeError, ValueError):
+        play_count = 0
+
     return {
         "id": str(song_id) if song_id else None,
         "title": title,
@@ -556,6 +563,7 @@ def _normalize_song_item(item: dict) -> dict | None:
         "duration": duration or None,
         "language": (item.get("language") or more.get("language") or None),
         "year": (item.get("year") or more.get("year") or None),
+        "play_count": play_count,
         "webpage_url": page,
         "thumbnail": _thumb(item.get("image") or more.get("image")),
     }
@@ -781,6 +789,17 @@ def _title_similarity(spec: dict, title: str) -> tuple[float, bool]:
     return min(1.0, sim), False
 
 
+def _popularity(play_count: int | None) -> float:
+    """Map JioSaavn's play count to a 0..1 signal (100M+ plays saturates)."""
+    try:
+        plays = int(play_count or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if plays <= 0:
+        return 0.0
+    return min(1.0, math.log10(plays + 1) / 8.0)
+
+
 def score_candidate(
     candidate: dict,
     spec: dict,
@@ -793,7 +812,9 @@ def score_candidate(
     Title similarity dominates; an artist named in the query is required when the
     candidate's own title doesn't account for those words. Editions (remix/live/
     slowed...) are matched explicitly so a plain request never silently returns a
-    different recording.
+    different recording. When nothing else separates two structurally identical
+    candidates (e.g. same title, no artist given), popularity is the tie-breaker so
+    the canonical recording outranks an obscure cover.
     """
     title = candidate.get("title") or ""
     artist = candidate.get("artist") or ""
@@ -849,9 +870,14 @@ def score_candidate(
         elif diff > 30:
             score -= 0.12
 
-    # Keep JioSaavn's own relevance ordering (which reflects popularity) but only
-    # as a small tie-breaker that decays with position.
-    score += 0.08 * (0.85 ** max(0, position))
+    # Popularity is a gentle tie-breaker: it only tips structurally identical
+    # matches (same title, no artist named) toward the canonical recording.
+    popularity = _popularity(candidate.get("play_count"))
+    score += 0.07 * popularity
+
+    # Keep JioSaavn's own relevance ordering as a last-resort tie-breaker for
+    # candidates that carry no popularity data.
+    score += 0.02 * (0.85 ** max(0, position))
 
     signals = {
         "exact_title": exact,
@@ -860,6 +886,8 @@ def score_candidate(
         "artist_hint": bool(artist_hint),
         "artist_mismatch": artist_mismatch,
         "versions": sorted(candidate_versions),
+        "play_count": int(candidate.get("play_count") or 0),
+        "popularity": round(popularity, 3),
     }
     return max(0.0, min(1.0, score)), signals
 
@@ -877,7 +905,10 @@ def rank_candidates(
             candidate, spec, reference_duration=reference_duration, position=position
         )
         ranked.append((score, candidate, signals))
-    ranked.sort(key=lambda row: row[0], reverse=True)
+    ranked.sort(
+        key=lambda row: (row[0], int(row[1].get("play_count") or 0)),
+        reverse=True,
+    )
     return ranked
 
 

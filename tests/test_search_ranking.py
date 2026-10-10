@@ -28,9 +28,9 @@ import cogs.music as m  # noqa: E402
 # --- Fixtures ------------------------------------------------------------
 
 
-def v3(song, artists, album, duration, language, url, song_id, image=None):
+def v3(song, artists, album, duration, language, url, song_id, image=None, play_count=None):
     """A JioSaavn v3 `search.getResults` song object."""
-    return {
+    item = {
         "song": song,
         "primary_artists": artists,
         "album": album,
@@ -40,6 +40,9 @@ def v3(song, artists, album, duration, language, url, song_id, image=None):
         "id": song_id,
         "image": image or "https://c.saavncdn.com/x-150x150.jpg",
     }
+    if play_count is not None:
+        item["play_count"] = str(play_count)
+    return item
 
 
 def v4(title, artists, album, duration, language, url, song_id, album_id=None):
@@ -114,9 +117,28 @@ THOSE_EYES = norm(
 )
 
 
+MEMORIES = norm(
+    # JioSaavn's relevance order lists an obscure cover first; the canonical
+    # single sits further down but has vastly more plays. With no artist named,
+    # popularity must break the tie.
+    v3("Memories", "Ronald Meirs", "Covers", 189, "english",
+       "https://www.jiosaavn.com/song/memories/A", "cover-ronald", play_count=833523),
+    v3("Memories", "Sarrb, Starboy X", "Sarrb", 251, "hindi",
+       "https://www.jiosaavn.com/song/memories/B", "sarrb", play_count=19948),
+    v3("Memories", "Maroon 5", "Memories", 189, "english",
+       "https://www.jiosaavn.com/song/memories/C", "maroon5", play_count=35547665),
+)
+
+
 def fake_flashing_search(query, limit=None):
     if "flashing" in query.lower():
         return [dict(c) for c in FLASHING_LIGHTS][: (limit or 5)]
+    return []
+
+
+def fake_memories_search(query, limit=None):
+    if "memories" in query.lower():
+        return [dict(c) for c in MEMORIES][: (limit or 5)]
     return []
 
 
@@ -230,6 +252,33 @@ class RelaxationTests(PatchedTestCase):
     def test_broad_query_keeps_the_requested_artist_on_top(self):
         results = m.search_candidates("Khat", m.MAX_POOL)
         self.assertEqual(results[0]["artist"], "Navjot Ahuja")
+
+
+class PopularityTieBreakTests(PatchedTestCase):
+    """With no artist named, the canonical (popular) recording must beat covers."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch(search_jiosaavn=fake_memories_search)
+
+    def test_popular_recording_beats_an_earlier_cover(self):
+        results = m.search_candidates("Memories", m.MAX_POOL)
+        self.assertTrue(results)
+        self.assertEqual(results[0]["artist"], "Maroon 5")
+        self.assertGreaterEqual(results[0]["signals"]["play_count"], 1_000_000)
+
+    def test_popularity_signal_is_populated(self):
+        results = m.search_candidates("Memories", m.MAX_POOL)
+        for candidate in results:
+            self.assertIn("popularity", candidate["signals"])
+            self.assertIn("play_count", candidate["signals"])
+
+    def test_popularity_scales_between_zero_and_one(self):
+        self.assertEqual(m._popularity(0), 0.0)
+        self.assertEqual(m._popularity(None), 0.0)
+        self.assertGreater(m._popularity(500_000), 0.0)
+        self.assertLessEqual(m._popularity(10_000_000_000), 1.0)
+        self.assertGreater(m._popularity(35_547_665), m._popularity(833_523))
 
 
 # --- Exact song search ("Those Eyes by New West") ------------------------

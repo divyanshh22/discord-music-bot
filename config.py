@@ -11,7 +11,7 @@ load_dotenv(BASE_DIR / ".env")
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Bumped by hand when behaviour changes so /version proves which code is live.
-BUILD = "2026-10-10.1-search-parsing"
+BUILD = "2026-10-10.2-popularity-ranking"
 
 # Render exposes these automatically; on a laptop they fall back to "local".
 GIT_COMMIT = os.getenv("RENDER_GIT_COMMIT", "local")
