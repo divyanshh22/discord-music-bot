@@ -3491,7 +3491,16 @@ class LikesView(discord.ui.View):
 
         async def _choose(interaction: discord.Interaction):
             self.selected = int(select.values[0])
-            await interaction.response.edit_message(view=self)
+            if 0 <= self.selected < len(self.entries):
+                item = self.entries[self.selected]
+                await interaction.response.send_message(
+                    f"Picked **{truncate(item.title, 60)}**  ·  now press ▶️ Play or 🗑️ Remove.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "That song is no longer in the list.", ephemeral=True
+                )
 
         select.callback = _choose
         self._select = select
