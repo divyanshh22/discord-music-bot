@@ -2259,15 +2259,15 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
         lines.append(f"`{'━' * 16}`  🔴 Live")
     lines.append("")
 
-    lines.append(
-        "  ·  ".join(
-            (
-                f"👤  **{truncate(track.requested_by, 40)}**",
-                f"⏱  {format_time(total) if total else 'Live'}",
-                f"📀  {len(player.queue)} in queue",
-            )
-        )
-    )
+    now_parts = [
+        f"👤  **{truncate(track.requested_by, 40)}**",
+        f"⏱  {format_time(total) if total else 'Live'}",
+        f"📀  {len(player.queue)} in queue",
+    ]
+    queue_seconds = sum(queued.duration for queued in player.queue if queued.duration)
+    if queue_seconds:
+        now_parts.append(f"⌛  {format_time(queue_seconds)} left")
+    lines.append("  ·  ".join(now_parts))
 
     status_bits = [f"♾️  Autoplay {'on' if player.autoplay else 'off'}"]
     if player.shuffle_enabled:
@@ -3350,35 +3350,50 @@ def build_queue_pages(player: MusicPlayer, per_page: int = 10) -> list[discord.E
     """The queue split into small embeds: now playing + a numbered slice."""
     entries = player.queue
     total_pages = max(1, (len(entries) + per_page - 1) // per_page)
+    total_seconds = sum(track.duration for track in entries if track.duration)
     pages: list[discord.Embed] = []
     for index in range(total_pages):
         chunk = entries[index * per_page : (index + 1) * per_page]
         embed = discord.Embed(
-            title=f"Queue — {len(entries)} track{'s' if len(entries) != 1 else ''}",
-            colour=ACCENT,
+            title=f"🎶 Queue — {len(entries)} track{'s' if len(entries) != 1 else ''}",
+            colour=TANGO_BLUE,
             timestamp=datetime.now(timezone.utc),
         )
-        embed.set_author(name="Audira", icon_url=BRAND_ICON)
+        if KAIST_LOGO_URL:
+            embed.set_author(name=f"🎵 {BRAND_NAME} — QUEUE", icon_url=KAIST_LOGO_URL)
+        else:
+            embed.set_author(name=f"🎵 {BRAND_NAME} — QUEUE")
         if player.current is not None:
             now = f"**{truncate(player.current.title, 80)}**"
-            if player.current.artist:
-                now += f" — {truncate(player.current.artist, 40)}"
-            embed.add_field(name="● Now playing", value=now, inline=False)
+            meta = [
+                bit
+                for bit in (
+                    truncate(player.current.artist, 40) if player.current.artist else "",
+                    player.current.duration_label(),
+                )
+                if bit
+            ]
+            if meta:
+                now += "\n" + "  ·  ".join(meta)
+            embed.add_field(name="🎧  Now playing", value=now, inline=False)
         lines = []
         for offset, track in enumerate(chunk):
             position = index * per_page + offset + 1
-            line = f"`{position:02d}` **{truncate(track.title, 60)}**"
+            line = f"`{position:02d}`  **{truncate(track.title, 60)}**"
             if track.artist:
                 line += f" — {truncate(track.artist, 30)}"
             if track.duration:
-                line += f" `{format_time(track.duration)}`"
+                line += f"  `{format_time(track.duration)}`"
             lines.append(line)
         embed.add_field(
-            name="Up next",
+            name="📜  Up next",
             value="\n".join(lines) if lines else "Nothing queued yet.",
             inline=False,
         )
-        embed.set_footer(text=f"Page {index + 1} / {total_pages}")
+        footer = f"Page {index + 1} / {total_pages}"
+        if total_seconds:
+            footer += f"  ·  ⏱ {format_time(total_seconds)} total"
+        embed.set_footer(text=footer)
         pages.append(embed)
     return pages
 
@@ -3788,23 +3803,11 @@ class Music(commands.Cog):
             await interaction.response.send_message("Nothing is playing right now.")
             return
 
-        embed = discord.Embed(title="Audira Queue", colour=discord.Colour.blurple())
-        embed.add_field(
-            name="Now Playing",
-            value=player.current.title if player.current else "—",
-            inline=False,
-        )
-
-        if player.queue:
-            lines = [
-                f"{i}. {song.title}"
-                for i, song in enumerate(player.queue[:10], start=1)
-            ]
-            if len(player.queue) > 10:
-                lines.append(f"...and {len(player.queue) - 10} more")
-            embed.add_field(name="Up Next", value="\n".join(lines), inline=False)
-
-        await interaction.response.send_message(embed=embed)
+        pages = build_queue_pages(player)
+        pager = QueuePager(pages)
+        await interaction.response.send_message(embed=pages[0], view=pager)
+        pager.message = await interaction.original_response()
+        pager.sync_state()
 
     @discord.app_commands.command(name="nowplaying", description="Show the current song.")
     async def nowplaying(self, interaction: discord.Interaction):
