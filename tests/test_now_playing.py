@@ -193,7 +193,7 @@ class PlayerViewTests(unittest.TestCase):
             [self.emoji(c) for c in rows[1]], ["🔀", "🔁", "🎵", "🤍"]
         )
         self.assertEqual(
-            [self.emoji(c) for c in rows[2]], ["🔗", "🔄", "🎤"]
+            [self.emoji(c) for c in rows[2]], ["♾️", "🔄", "🎤"]
         )
 
     def test_controls_have_compact_native_text_labels(self):
@@ -242,10 +242,10 @@ class PlayerViewTests(unittest.TestCase):
 
     def test_autoplay_is_highlighted_when_enabled(self):
         _player, off = self.make(current=StubTrack(), autoplay=False)
-        self.assertEqual(self.find(off, "🔗").style, discord.ButtonStyle.secondary)
+        self.assertEqual(self.find(off, "♾️").style, discord.ButtonStyle.secondary)
 
         _player, on = self.make(current=StubTrack(), autoplay=True)
-        self.assertEqual(self.find(on, "🔗").style, discord.ButtonStyle.success)
+        self.assertEqual(self.find(on, "♾️").style, discord.ButtonStyle.success)
 
     def test_like_highlights_only_for_liked_tracks(self):
         track = StubTrack(song_id="ABC")
