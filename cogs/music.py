@@ -2834,24 +2834,44 @@ class MusicPlayer:
             asyncio.create_task(self.notify_channel.send(message))
 
     def _announce(self, track: Track) -> None:
-        """Keep the persistent Tango player card running for this song."""
+        """Post a fresh Tango player card for this song, freezing the previous one."""
         if track.announced:
             track.announced = False
             return
         if self.notify_channel is None:
             return
+
+        # Leave the previous song's card in the chat as its own message.
+        previous_message, self._now_message = self._now_message, None
+        previous_view, self._view = self._view, None
+        if previous_message is not None:
+            asyncio.create_task(self._freeze_card(previous_message, previous_view))
+
         self._card_finalized = False
-        if self._view is None or self._view.retired:
-            self._view = PlayerView(self)
         if self._now_task and not self._now_task.done():
             self._now_task.cancel()
         self._now_task = asyncio.create_task(self._now_card(track))
 
-    async def _now_card(self, track: Track) -> None:
-        """One persistent player message per guild: post once, then edit it in place."""
-        view = self._view
+    async def _freeze_card(
+        self, message: discord.Message, view: "PlayerView | None"
+    ) -> None:
+        """Disable the controls on a card whose song has already moved on."""
         if view is not None:
-            view.sync()
+            view.retired = True
+            for item in view.children:
+                item.disabled = True
+        try:
+            await message.edit(view=view)
+        except discord.HTTPException:
+            log.debug("could not freeze the previous player card", exc_info=True)
+        if view is not None:
+            view.stop()
+
+    async def _now_card(self, track: Track) -> None:
+        """One card per song: post a fresh message, then edit it until it ends."""
+        view = PlayerView(self)
+        self._view = view
+        view.sync()
         notify = self.notify_channel
 
         async def push(embed: discord.Embed) -> discord.Message | None:
