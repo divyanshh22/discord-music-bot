@@ -529,6 +529,36 @@ def _normalize_song_item(item: dict) -> dict | None:
         artist = subtitle.split(" - ", 1)[0].strip()
     artist = artist.replace("&amp;", "&").strip() or None
 
+    featured = [
+        (a.get("name") or "").strip()
+        for a in (artist_map.get("featured_artists") or [])
+        if (a.get("name") or "").strip()
+    ]
+    if not featured:
+        raw_featured = item.get("featured_artists")
+        if isinstance(raw_featured, str):
+            featured = [part.strip() for part in raw_featured.split(",") if part.strip()]
+    featured = [name.replace("&amp;", "&") for name in featured]
+
+    album_artists = artist_map.get("album_artists") or []
+    if not isinstance(album_artists, list):
+        album_artists = []
+    album_artist = ", ".join(
+        (a.get("name") or "").strip()
+        for a in album_artists
+        if (a.get("name") or "").strip()
+    )
+    album_artist = (
+        album_artist
+        or more.get("album_artist")
+        or item.get("album_artist")
+        or None
+    )
+    if isinstance(album_artist, str):
+        album_artist = album_artist.replace("&amp;", "&").strip() or None
+    else:
+        album_artist = None
+
     title = (item.get("song") or item.get("title") or "").strip()
     if not title:
         return None
@@ -558,6 +588,8 @@ def _normalize_song_item(item: dict) -> dict | None:
         "title": title,
         "artist": artist,
         "artist_ids": artist_ids,
+        "featured_artists": ", ".join(featured) or None,
+        "album_artist": album_artist,
         "album": album,
         "album_id": str(album_id) if album_id else None,
         "duration": duration or None,
@@ -642,6 +674,29 @@ _SUFFIX_NOISE = re.compile(
     re.I,
 )
 
+# Cover/karaoke/tribute markers. JioSaavn is full of "originally performed by",
+# "in the style of", "made famous by" and karaoke uploads whose *titles* name the
+# original artist; left alone they masquerade as exact title matches and hide the
+# fact that the performer is not the artist the user asked for.
+_COVER_CREDIT = re.compile(
+    r"\b(?:originally\s+performed(?:\s+by)?|performed\s+by|in\s+the\s+style\s+of|"
+    r"made\s+(?:famous|popular)\s+by|as\s+made\s+famous\s+by|"
+    r"a\s+tribute\s+to|tribute\s+to)\b.*$",
+    re.I,
+)
+_COVER_INDICATOR = re.compile(
+    r"\b(?:karaoke|cover(?:\s+version)?|tribute|backing\s+track|"
+    r"originally\s+performed|performed\s+by|in\s+the\s+style\s+of|"
+    r"made\s+(?:famous|popular)\s+by|as\s+made\s+famous\s+by)\b",
+    re.I,
+)
+_COVER_ARTIST = re.compile(
+    r"\b(?:karaoke|tribute|backing|cover\s+band|cover\s+version|"
+    r"made\s+famous|originally\s+performed|performed\s+by|"
+    r"the\s+karaoke\s+channel|studio\s+group|sing\s+like)\b",
+    re.I,
+)
+
 
 def _strip_accents(text: str) -> str:
     return _ACCENT.sub("", unicodedata.normalize("NFKD", text or ""))
@@ -670,12 +725,72 @@ def _version_tags(text: str) -> frozenset[str]:
     for word in re.findall(r"[a-z0-9\-]+", _norm_text(outside)):
         if word in _VERSION_WORDS:
             tags.add(_VERSION_ALIASES.get(word, word))
+    if _COVER_INDICATOR.search(text or ""):
+        tags.add("cover")
     return frozenset(tags)
+
+
+def _manual_version_tags(text: str) -> frozenset[str]:
+    """Find explicit editions without treating ordinary title words as editions."""
+    tags: set[str] = set()
+    bracket_chunks = _BRACKETS.findall(text or "")
+    for chunk in bracket_chunks:
+        for word in re.findall(r"[a-z0-9\-]+", _norm_text(chunk)):
+            if word in _VERSION_WORDS and word != "version":
+                tags.add(_VERSION_ALIASES.get(word, word))
+        if _COVER_INDICATOR.search(chunk):
+            tags.add("cover")
+
+    outside = _norm_text(_BRACKETS.sub(" ", text or ""))
+    for word in _VERSION_WORDS:
+        if word == "version":
+            continue
+        normalized_word = _norm_text(word)
+        if re.search(
+            rf"(?:^|\s){re.escape(normalized_word)}(?:\s+(?:version|edit|mix))?$",
+            outside,
+        ):
+            tags.add(_VERSION_ALIASES.get(word, word))
+    if re.search(r"(?:^|\s)(?:backing\s+track|covers?|karaoke|tribute)$", outside):
+        tags.add("cover")
+    if _COVER_CREDIT.search(_BRACKETS.sub(" ", text or "")):
+        tags.add("cover")
+    return frozenset(tags)
+
+
+def _candidate_version_tags(candidate: dict) -> frozenset[str]:
+    title_tags = set(_manual_version_tags(candidate.get("title") or ""))
+    album = _norm_text(candidate.get("album") or "")
+    for word in _VERSION_WORDS - {"karaoke", "cover", "tribute", "backing", "version"}:
+        if re.search(rf"(?:^|\s){re.escape(_norm_text(word))}(?:$|\s)", album):
+            title_tags.add(_VERSION_ALIASES.get(word, word))
+    if re.search(r"\bkaraoke\b", album):
+        title_tags.update({"karaoke", "cover"})
+    if re.search(r"\b(?:covers?|cover\s+version|tribute|backing\s+tracks?)\b", album):
+        title_tags.add("cover")
+        if re.search(r"\btribute\b", album):
+            title_tags.add("tribute")
+    return frozenset(title_tags)
+
+
+def _manual_cover_like(candidate: dict) -> bool:
+    return bool(
+        "cover" in _candidate_version_tags(candidate)
+        or _looks_like_cover_artist(
+            candidate.get("artist"),
+            f"{candidate.get('featured_artists') or ''} "
+            f"{candidate.get('album_artist') or ''}",
+        )
+    )
 
 
 def _title_core(text: str) -> str:
     """The main title with edition tags and 'feat.' credits removed."""
     text = _BRACKETS.sub(" ", text or "")
+    # A cover/karaoke credit ("... originally performed by X") names the original
+    # artist; drop everything from the credit onwards so the real title can match
+    # and the artist words become a proper artist hint again.
+    text = _COVER_CREDIT.sub(" ", text)
     text = re.sub(r"\b(feat|ft|featuring|with)\b\.?.*$", " ", text, flags=re.I)
     # Strip trailing noise, repeating so stacked tags ("Song - Official Audio")
     # are all removed.
@@ -714,7 +829,7 @@ def _split_explicit(query: str) -> tuple[str | None, str | None, str | None]:
     return None, None, None
 
 
-def _parse_query(query: str) -> dict:
+def _parse_query(query: str, *, manual_search: bool = False) -> dict:
     """Split a request into its title/artist parts and matching signals.
 
     `core` is the title to compare against results (artist words are excluded
@@ -722,8 +837,15 @@ def _parse_query(query: str) -> dict:
     meaningful word so an artist named after the title can still be detected.
     """
     raw = (query or "").strip()
-    title, artist, separator = _split_explicit(raw)
-    core = _title_core(title or raw)
+    parse_text = raw
+    if manual_search:
+        while True:
+            stripped = _SUFFIX_NOISE.sub("", parse_text)
+            if stripped == parse_text:
+                break
+            parse_text = stripped.strip()
+    title, artist, separator = _split_explicit(parse_text)
+    core = _title_core(title or parse_text)
     tokens = _content_tokens(core)
     if artist:
         tokens |= _content_tokens(artist)
@@ -734,6 +856,7 @@ def _parse_query(query: str) -> dict:
         "separator": separator,
         "core": core,
         "version": _version_tags(raw),
+        "manual_version": _manual_version_tags(parse_text) if manual_search else frozenset(),
         "tokens": tokens,
     }
 
@@ -800,12 +923,18 @@ def _popularity(play_count: int | None) -> float:
     return min(1.0, math.log10(plays + 1) / 8.0)
 
 
+def _looks_like_cover_artist(artist: str | None, featured: str | None = None) -> bool:
+    """True when the performer's own name marks karaoke/cover/tribute uploads."""
+    return bool(_COVER_ARTIST.search(f"{artist or ''} {featured or ''}"))
+
+
 def score_candidate(
     candidate: dict,
     spec: dict,
     *,
     reference_duration: int | None = None,
     position: int = 0,
+    manual_search: bool = False,
 ) -> tuple[float, dict]:
     """A weighted 0..1 confidence that `candidate` is the song the user asked for.
 
@@ -819,7 +948,11 @@ def score_candidate(
     title = candidate.get("title") or ""
     artist = candidate.get("artist") or ""
     q_tokens = spec.get("tokens") or set()
-    requested_versions = spec.get("version") or set()
+    requested_versions = (
+        spec.get("manual_version") or set()
+        if manual_search
+        else spec.get("version") or set()
+    )
 
     title_sim, exact = _title_similarity(spec, title)
     score = 0.60 * title_sim
@@ -827,7 +960,11 @@ def score_candidate(
         score += 0.10
 
     candidate_title_tokens = _content_tokens(title)
-    artist_tokens = _content_tokens(artist)
+    artist_tokens = _content_tokens(artist) | _content_tokens(
+        candidate.get("featured_artists") or ""
+    )
+    if manual_search and not artist_tokens:
+        artist_tokens |= _content_tokens(candidate.get("album_artist") or "")
     # Query words the candidate's title doesn't explain are treated as an artist
     # hint: "Flashing Lights Kanye West" -> {kanye, west}.
     artist_hint = q_tokens - candidate_title_tokens - set(requested_versions)
@@ -848,9 +985,18 @@ def score_candidate(
     else:
         score += 0.12
 
-    candidate_versions = _version_tags(title)
+    candidate_versions = (
+        _candidate_version_tags(candidate)
+        if manual_search
+        else _version_tags(title)
+    )
     if requested_versions:
-        if requested_versions <= candidate_versions:
+        version_match = (
+            requested_versions == candidate_versions
+            if manual_search
+            else requested_versions <= candidate_versions
+        )
+        if version_match:
             score += 0.12
         elif requested_versions & candidate_versions:
             score += 0.04
@@ -860,6 +1006,19 @@ def score_candidate(
         score -= 0.12
     else:
         score += 0.10
+
+    # Karaoke / cover / tribute / backing uploads are never the recording a plain
+    # request means, unless the user explicitly asked for one. Detect them from
+    # both the title and the performer's name.
+    requested_cover = bool(requested_versions & {"cover", "karaoke", "tribute"})
+    cover_like = bool(
+        _COVER_INDICATOR.search(title)
+        or _looks_like_cover_artist(artist, candidate.get("featured_artists"))
+    )
+    if manual_search:
+        cover_like = _manual_cover_like(candidate)
+    if cover_like and not requested_cover:
+        score -= 0.38 if manual_search else 0.25
 
     if reference_duration and candidate.get("duration"):
         diff = abs(int(candidate["duration"]) - int(reference_duration))
@@ -886,6 +1045,7 @@ def score_candidate(
         "artist_hint": bool(artist_hint),
         "artist_mismatch": artist_mismatch,
         "versions": sorted(candidate_versions),
+        "cover_like": cover_like,
         "play_count": int(candidate.get("play_count") or 0),
         "popularity": round(popularity, 3),
     }
@@ -897,12 +1057,17 @@ def rank_candidates(
     spec: dict,
     *,
     reference_duration: int | None = None,
+    manual_search: bool = False,
 ) -> list[tuple[float, dict, dict]]:
     """Score every candidate and return them strongest-first."""
     ranked: list[tuple[float, dict, dict]] = []
     for position, candidate in enumerate(candidates):
         score, signals = score_candidate(
-            candidate, spec, reference_duration=reference_duration, position=position
+            candidate,
+            spec,
+            reference_duration=reference_duration,
+            position=position,
+            manual_search=manual_search,
         )
         ranked.append((score, candidate, signals))
     ranked.sort(
@@ -1528,6 +1693,104 @@ class StreamResolveError(LookupError):
     """
 
 
+def _candidate_allowed_for_request(candidate: dict, spec: dict) -> bool:
+    """Exclude unrequested editions and cover-style uploads from manual playback."""
+    requested_versions = set(spec.get("manual_version") or ())
+    candidate_versions = set(_candidate_version_tags(candidate))
+    if requested_versions:
+        if requested_versions != candidate_versions:
+            return False
+    elif candidate_versions:
+        return False
+
+    cover_like = bool(
+        (candidate.get("signals") or {}).get("cover_like")
+        or _manual_cover_like(candidate)
+    )
+    requested_cover = bool(requested_versions & {"cover", "karaoke", "tribute"})
+    return not cover_like or requested_cover
+
+
+def _same_recording_candidate(candidate: dict, best: dict, spec: dict) -> bool:
+    """Permit stream fallback only among metadata-equivalent recordings."""
+    if not _candidate_allowed_for_request(candidate, spec):
+        return False
+    signals = candidate.get("signals") or {}
+    if signals.get("artist_mismatch"):
+        return False
+    if _norm_text(_title_core(candidate.get("title") or "")) != _norm_text(
+        _title_core(best.get("title") or "")
+    ):
+        return False
+    if _candidate_version_tags(candidate) != _candidate_version_tags(best):
+        return False
+    candidate_duration = candidate.get("duration")
+    best_duration = best.get("duration")
+    if candidate_duration and best_duration:
+        if abs(int(candidate_duration) - int(best_duration)) > 15:
+            return False
+
+    candidate_id = str(candidate.get("id") or "")
+    best_id = str(best.get("id") or "")
+    if candidate_id and candidate_id == best_id:
+        return True
+    candidate_artist_ids = set(candidate.get("artist_ids") or ())
+    best_artist_ids = set(best.get("artist_ids") or ())
+    if candidate_artist_ids and best_artist_ids:
+        return bool(candidate_artist_ids & best_artist_ids)
+    candidate_artist = _norm_text(candidate.get("artist") or "")
+    best_artist = _norm_text(best.get("artist") or "")
+    return bool(candidate_artist and candidate_artist == best_artist)
+
+
+def _resolved_info_matches_candidate(info: dict, candidate: dict) -> bool:
+    """Ensure yt-dlp resolved the selected JioSaavn result, not another item."""
+    candidate_url = candidate.get("webpage_url") or ""
+    resolved_url = info.get("webpage_url") or info.get("original_url") or ""
+    candidate_token = _jiosaavn_song_id(candidate_url)
+    resolved_token = _jiosaavn_song_id(resolved_url)
+    if candidate_token and resolved_token and candidate_token != resolved_token:
+        return False
+
+    expected_title = _norm_text(_title_core(candidate.get("title") or ""))
+    resolved_title = _norm_text(_title_core(info.get("title") or ""))
+    if expected_title and resolved_title:
+        similarity = SequenceMatcher(None, expected_title, resolved_title).ratio()
+        if expected_title != resolved_title and similarity < 0.82:
+            return False
+
+    expected_versions = set(_candidate_version_tags(candidate))
+    resolved_versions = set(_manual_version_tags(info.get("title") or ""))
+    if resolved_versions and not resolved_versions.issubset(expected_versions):
+        return False
+
+    expected_artist = _content_tokens(candidate.get("artist") or "")
+    resolved_artist = _content_tokens(info.get("artist") or info.get("creator") or "")
+    if expected_artist and resolved_artist and not (expected_artist & resolved_artist):
+        return False
+    return True
+
+
+async def _resolve_jiosaavn_candidate(
+    candidate: dict, requested_by: str, requested_query: str
+) -> Track:
+    """Resolve one ranked candidate while preserving its validated identity."""
+    url = candidate.get("webpage_url")
+    if not url:
+        raise LookupError("JioSaavn candidate has no song URL")
+    info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, url)
+    if not info:
+        raise LookupError("JioSaavn returned no playable track for that result")
+    if not _resolved_info_matches_candidate(info, candidate):
+        raise LookupError("JioSaavn resolved a different song than the selected result")
+    track = _build_track(info, requested_query, requested_by, candidate=candidate)
+    candidate_id = candidate.get("id")
+    if candidate_id and track.song_id != str(candidate_id):
+        raise LookupError("JioSaavn track identity changed during stream resolution")
+    track.requested_query = requested_query
+    return track
+
+
 async def resolve_track(query: str, requested_by: str) -> Track:
     """Resolve local files or JioSaavn tracks; never stream from other platforms."""
     query = query.strip()
@@ -1576,6 +1839,18 @@ async def resolve_track(query: str, requested_by: str) -> Track:
     if not candidates:
         raise LookupError("no results")
 
+    spec = _parse_query(query, manual_search=True)
+    candidates = [
+        candidate
+        for candidate in candidates
+        if _candidate_allowed_for_request(candidate, spec)
+    ]
+    if not candidates:
+        raise LookupError(
+            f"I couldn't find a standard recording of **{query}** on JioSaavn. "
+            "Try specifying the version you want."
+        )
+
     best = candidates[0]
     best_score = float(best.get("score") or 0.0)
     best_signals = best.get("signals") or {}
@@ -1620,6 +1895,36 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         )
         raise AmbiguousMatch(query, alternatives)
 
+    # No artist was named and two different, similarly popular recordings match
+    # the title equally well. Popularity can't break this tie, so ask the user
+    # instead of silently playing one of them.
+    if not best_signals.get("artist_hint") and best_score >= CONFIDENCE_HIGH:
+        best_pc = int(best_signals.get("play_count") or 0)
+        best_artist = _norm_text(best.get("artist") or "")
+        for candidate in alternatives[1:]:
+            alt_artist = _norm_text(candidate.get("artist") or "")
+            if not alt_artist or alt_artist == best_artist:
+                continue
+            if abs(float(candidate.get("score") or 0.0) - best_score) > 0.03:
+                break
+            alt_pc = int((candidate.get("signals") or {}).get("play_count") or 0)
+            similar_popularity = (
+                best_pc <= 0 and alt_pc <= 0
+            ) or (
+                best_pc > 0
+                and alt_pc > 0
+                and 0.5 <= (alt_pc / best_pc) <= 2.0
+            )
+            if similar_popularity:
+                log.info(
+                    "resolving %r: title matches two comparably popular artists, "
+                    "offering %d choice(s)",
+                    query,
+                    len(alternatives),
+                )
+                raise AmbiguousMatch(query, alternatives)
+            break
+
     artist_required = bool(best_signals.get("artist_hint"))
     threshold = max(CONFIDENCE_MEDIUM, best_score - CONFIDENCE_MARGIN)
     log.info(
@@ -1639,18 +1944,17 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         signals = candidate.get("signals") or {}
         if artist_required and signals.get("artist_mismatch"):
             continue
-        url = candidate.get("webpage_url")
-        if not url:
+        if candidate is not best and not _same_recording_candidate(candidate, best, spec):
             continue
         try:
-            info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, url)
-            if info:
-                track = _build_track(info, query, requested_by, candidate=candidate)
-                track.requested_query = query
-                return track
+            return await _resolve_jiosaavn_candidate(candidate, requested_by, query)
         except Exception as exc:
             last_error = exc
-            log.warning("JioSaavn candidate resolve failed for %r: %s", url, reason_line(exc))
+            log.warning(
+                "JioSaavn candidate resolve failed for %r: %s",
+                candidate.get("webpage_url"),
+                reason_line(exc),
+            )
 
     # A track existed on JioSaavn but we couldn't get audio for it - that is a
     # stream failure, not a search failure.
@@ -1671,7 +1975,7 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     if not query:
         raise ValueError("empty query")
 
-    spec = _parse_query(query)
+    spec = _parse_query(query, manual_search=True)
     try:
         pool = _search_pool(query, spec, limit=max(limit, SEARCH_EARLY_STOP))
     except LookupError:
@@ -1683,7 +1987,7 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     if not pool:
         raise LookupError("no results")
 
-    ranked = rank_candidates(pool, spec)
+    ranked = rank_candidates(pool, spec, manual_search=True)
     log.info(
         "JioSaavn search %r: provider=jiosaavn, %d candidate(s), best=%.2f %r by %r",
         query,
@@ -3070,9 +3374,10 @@ class SearchPicker(discord.ui.View):
 
         try:
             track = await asyncio.wait_for(
-                resolve_track(
-                    chosen["webpage_url"],
+                _resolve_jiosaavn_candidate(
+                    chosen,
                     interaction.user.display_name,
+                    chosen.get("title") or "JioSaavn search result",
                 ),
                 timeout=100,
             )

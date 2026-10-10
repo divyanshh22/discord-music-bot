@@ -116,6 +116,27 @@ THOSE_EYES = norm(
        "https://www.jiosaavn.com/song/those-eyes/D", "right-newwest"),
 )
 
+SHAPE_OF_YOU = norm(
+     v3("Shape of You", "Karaoke Group", "Karaoke Hits", 233, "english",
+         "https://www.jiosaavn.com/song/shape-of-you/karaoke", "shape-karaoke"),
+     v3("Shape of You", "Ed Sheeran", "Shape of You", 233, "english",
+         "https://www.jiosaavn.com/song/shape-of-you/ed-sheeran", "shape-ed", play_count=50000000),
+)
+
+FLASHING_LIGHTS_CANONICAL = norm(
+     v3("Flashing Lights", "RoadTrip", "Karaoke Hits", 237, "english",
+         "https://www.jiosaavn.com/song/flashing-lights/karaoke", "flashing-karaoke"),
+     v3("Flashing Lights", "Kanye West", "Graduation", 237, "english",
+         "https://www.jiosaavn.com/song/flashing-lights/kanye", "flashing-kanye", play_count=50000000),
+)
+
+BLINDING_LIGHTS = norm(
+     v3("Blinding Lights", "Other Singer", "Singles", 200, "english",
+         "https://www.jiosaavn.com/song/blinding-lights/other", "blinding-other", play_count=10),
+     v3("Blinding Lights", "The Weeknd", "After Hours", 200, "english",
+         "https://www.jiosaavn.com/song/blinding-lights/weeknd", "blinding-weeknd", play_count=50000000),
+)
+
 
 MEMORIES = norm(
     # JioSaavn's relevance order lists an obscure cover first; the canonical
@@ -238,6 +259,69 @@ class SearchRankingTests(PatchedTestCase):
             self.assertIsInstance(candidate["signals"], dict)
 
 
+class OriginalRecordingTests(PatchedTestCase):
+    def test_shape_of_you_prefers_ed_sheeran_over_karaoke(self):
+        self.patch(search_jiosaavn=lambda query, limit=None: [dict(c) for c in SHAPE_OF_YOU])
+        results = m.search_candidates("Shape of You", m.MAX_POOL)
+        self.assertEqual(results[0]["artist"], "Ed Sheeran")
+        self.assertEqual(results[0]["id"], "shape-ed")
+
+    def test_flashing_lights_prefers_kanye_when_catalog_metadata_supports_it(self):
+        self.patch(
+            search_jiosaavn=lambda query, limit=None: [
+                dict(c) for c in FLASHING_LIGHTS_CANONICAL
+            ]
+        )
+        results = m.search_candidates("Flashing Lights", m.MAX_POOL)
+        self.assertEqual(results[0]["artist"], "Kanye West")
+        self.assertEqual(results[0]["id"], "flashing-kanye")
+
+    def test_trailing_artist_hint_selects_the_weeknd(self):
+        self.patch(search_jiosaavn=lambda query, limit=None: [dict(c) for c in BLINDING_LIGHTS])
+        results = m.search_candidates("Blinding Lights The Weeknd", m.MAX_POOL)
+        self.assertEqual(results[0]["artist"], "The Weeknd")
+        self.assertEqual(results[0]["id"], "blinding-weeknd")
+
+    def test_standard_request_rejects_nonstandard_recording_types(self):
+        spec = m._parse_query("Song Title", manual_search=True)
+        for suffix in (
+            "Karaoke", "Cover", "Tribute", "Instrumental", "Backing Track", "Live", "Remix"
+        ):
+            candidate = make_candidate(
+                f"Song Title ({suffix})", "Performer", f"id-{suffix.lower()}"
+            )
+            self.assertFalse(
+                m._candidate_allowed_for_request(candidate, spec), suffix
+            )
+
+    def test_explicit_version_requests_remain_eligible(self):
+        cases = (
+            ("Song Title Karaoke", "Song Title (Karaoke)"),
+            ("Song Title Cover", "Song Title (Cover)"),
+            ("Song Title Remix", "Song Title (Remix)"),
+            ("Song Title Live", "Song Title (Live)"),
+            ("Song Title Instrumental", "Song Title (Instrumental)"),
+        )
+        for query, title in cases:
+            candidate = make_candidate(title, "Performer", title)
+            self.assertTrue(
+                m._candidate_allowed_for_request(
+                    candidate, m._parse_query(query, manual_search=True)
+                ),
+                query,
+            )
+
+    def test_album_edition_signals_are_manual_only(self):
+        candidate = make_candidate("Song Title", "Performer", "song", album="Karaoke Hits")
+        spec = m._parse_query("Song Title", manual_search=True)
+        _score, autoplay_signals = m.score_candidate(candidate, spec)
+        _manual_score, manual_signals = m.score_candidate(
+            candidate, spec, manual_search=True
+        )
+        self.assertFalse(autoplay_signals["cover_like"])
+        self.assertTrue(manual_signals["cover_like"])
+
+
 class RelaxationTests(PatchedTestCase):
     def setUp(self):
         super().setUp()
@@ -339,6 +423,22 @@ class SearchAccuracyTests(PatchedTestCase):
         spec = m._parse_query("Those Eyes (Official Audio)")
         self.assertEqual(spec["core"], "those eyes")
 
+    def test_upload_suffix_after_artist_does_not_pollute_artist_match(self):
+        spec = m._parse_query(
+            "Blinding Lights by The Weeknd official audio", manual_search=True
+        )
+        self.assertEqual(spec["title"], "Blinding Lights")
+        self.assertEqual(spec["artist"], "The Weeknd")
+        self.assertEqual(spec["core"], "blinding lights")
+
+    def test_leading_live_word_can_be_part_of_a_normal_title(self):
+        spec = m._parse_query("Live Your Life", manual_search=True)
+        candidate = make_candidate("Live Your Life", "T.I.", "live-your-life")
+        self.assertNotIn("live", spec["manual_version"])
+        self.assertTrue(m._candidate_allowed_for_request(candidate, spec))
+        cover_title = make_candidate("Cover Me", "Performer", "cover-me")
+        self.assertTrue(m._candidate_allowed_for_request(cover_title, spec))
+
 
 # --- resolve_track confidence gate (async) -------------------------------
 
@@ -352,7 +452,7 @@ class ResolveTrackTests(PatchedTestCase):
             self.extracted.append(url)
             if url.endswith("/F"):
                 raise RuntimeError("stream unavailable")
-            return {"title": "ok", "webpage_url": url, "url": "http://media"}
+            return {"webpage_url": url, "url": "http://media"}
 
         def fake_build(info, query, requested_by, *, candidate=None):
             return m.Track(
@@ -417,6 +517,20 @@ class ResolveTrackTests(PatchedTestCase):
         self.assertEqual([c["id"] for c in ctx.exception.candidates], ["a", "b"])
         self.assertEqual(self.extracted, [], "nothing may stream before the user picks")
 
+    def test_missing_popularity_offers_same_title_artist_choices(self):
+        self.patch(search_candidates=lambda q, limit=5: [
+            {"id": "a", "title": "Those Eyes", "artist": "New West",
+             "webpage_url": "https://www.jiosaavn.com/song/those-eyes/a",
+             "score": 0.9, "signals": {"artist_hint": False, "artist_mismatch": False}},
+            {"id": "b", "title": "Those Eyes", "artist": "Jazz Trio",
+             "webpage_url": "https://www.jiosaavn.com/song/those-eyes/b",
+             "score": 0.9, "signals": {"artist_hint": False, "artist_mismatch": False}},
+        ])
+        with self.assertRaises(m.AmbiguousMatch) as ctx:
+            self.run_resolve("Those Eyes")
+        self.assertEqual([candidate["id"] for candidate in ctx.exception.candidates], ["a", "b"])
+        self.assertEqual(self.extracted, [])
+
     def test_confident_match_is_not_ambiguous(self):
         self.patch(search_candidates=lambda q, limit=5: [
             {"id": "a", "title": "Those Eyes", "artist": "New West",
@@ -443,6 +557,78 @@ class ResolveTrackTests(PatchedTestCase):
         ])
         track = self.run_resolve("Those Eyes by New West")
         self.assertEqual(track.requested_query, "Those Eyes by New West")
+
+    def test_failed_original_does_not_fall_back_to_a_cover(self):
+        original = {
+            "id": "original-id", "title": "Flashing Lights", "artist": "Kanye West",
+            "webpage_url": "https://www.jiosaavn.com/song/flashing-lights/original",
+            "score": 0.92,
+            "signals": {"artist_hint": True, "artist_mismatch": False, "cover_like": False},
+        }
+        cover = {
+            "id": "cover-id", "title": "Flashing Lights (Karaoke)", "artist": "Kanye West",
+            "webpage_url": "https://www.jiosaavn.com/song/flashing-lights/cover",
+            "score": 0.82,
+            "signals": {"artist_hint": True, "artist_mismatch": False, "cover_like": True},
+        }
+        self.patch(search_candidates=lambda q, limit=5: [original, cover])
+
+        def fail_original(_opts, url):
+            self.extracted.append(url)
+            if url.endswith("/original"):
+                raise RuntimeError("original stream unavailable")
+            return {"title": "Flashing Lights", "artist": "Kanye West", "url": "http://media"}
+
+        self.patch(_extract_once=fail_original)
+        with self.assertRaises(m.StreamResolveError):
+            self.run_resolve("Flashing Lights by Kanye West")
+        self.assertEqual(self.extracted, [original["webpage_url"]])
+
+    def test_failed_stream_does_not_fall_back_to_another_artist(self):
+        original = {
+            "id": "original-id", "title": "Flashing Lights", "artist": "Kanye West",
+            "webpage_url": "https://www.jiosaavn.com/song/flashing-lights/original",
+            "score": 0.92,
+            "signals": {"artist_hint": False, "artist_mismatch": False, "play_count": 50000000},
+        }
+        unrelated = {
+            "id": "other-id", "title": "Flashing Lights", "artist": "RoadTrip",
+            "webpage_url": "https://www.jiosaavn.com/song/flashing-lights/other",
+            "score": 0.90,
+            "signals": {"artist_hint": False, "artist_mismatch": False, "play_count": 100},
+        }
+        self.patch(search_candidates=lambda q, limit=5: [original, unrelated])
+
+        def fail_original(_opts, url):
+            self.extracted.append(url)
+            raise RuntimeError("original stream unavailable")
+
+        self.patch(_extract_once=fail_original)
+        with self.assertRaises(m.StreamResolveError):
+            self.run_resolve("Flashing Lights")
+        self.assertEqual(self.extracted, [original["webpage_url"]])
+
+    def test_extractor_metadata_must_match_the_validated_candidate(self):
+        candidate = {
+            "id": "validated-id", "title": "Those Eyes", "artist": "New West",
+            "webpage_url": "https://www.jiosaavn.com/song/those-eyes/validated-token",
+            "score": 0.9,
+            "signals": {"artist_hint": True, "artist_mismatch": False},
+        }
+        self.patch(search_candidates=lambda q, limit=5: [candidate])
+
+        def return_different_track(_opts, url):
+            self.extracted.append(url)
+            return {
+                "title": "Unrelated Song", "artist": "Different Artist",
+                "webpage_url": "https://www.jiosaavn.com/song/unrelated/other-token",
+                "url": "http://media",
+            }
+
+        self.patch(_extract_once=return_different_track)
+        with self.assertRaises(m.StreamResolveError):
+            self.run_resolve("Those Eyes by New West")
+        self.assertEqual(self.extracted, [candidate["webpage_url"]])
 
 
 # --- Autoplay recommendations --------------------------------------------
