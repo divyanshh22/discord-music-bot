@@ -187,13 +187,13 @@ class PlayerViewTests(unittest.TestCase):
         _player, view = self.make()
         rows = self.rows(view)
         self.assertEqual(
-            [self.emoji(c) for c in rows[0]], ["⏮️", "⏸️", "⏭️", "🔀", "🔁"]
+            [self.emoji(c) for c in rows[0]], ["⏮️", "⏸️", "⏭️", "🛑"]
         )
         self.assertEqual(
-            [self.emoji(c) for c in rows[1]], ["🛑", "🎵", "🤍", "🔗"]
+            [self.emoji(c) for c in rows[1]], ["🔀", "🔁", "🎵", "🤍"]
         )
         self.assertEqual(
-            [self.emoji(c) for c in rows[2]], ["🔄", "🎤"]
+            [self.emoji(c) for c in rows[2]], ["🔗", "🔄", "🎤"]
         )
 
     def test_controls_have_compact_native_text_labels(self):
@@ -201,7 +201,7 @@ class PlayerViewTests(unittest.TestCase):
         labels = [child.label for child in view.children]
         self.assertEqual(
             labels,
-            ["Prev", "Pause", "Skip", "Shuffle", "Repeat", "Stop", "Queue", "Like",
+            ["Prev", "Pause", "Skip", "Stop", "Shuffle", "Repeat", "Queue", "Like",
              "Autoplay", "Restart", "Lyrics"],
         )
 

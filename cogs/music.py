@@ -157,7 +157,9 @@ CARD_TICK = 1.5
 # is tuned to those limits rather than invented CSS.
 BRAND_NAME = "TANGO"
 TANGO_BLUE = discord.Colour.from_rgb(88, 101, 242)
-DIVIDER = "─" * 16
+# Short, quiet rule that separates the card body from the button row (Discord
+# embeds have no themeable dividers, so a short dash line stays restrained).
+DIVIDER = "─" * 10
 
 
 def format_time(seconds: int | None) -> str:
@@ -2265,7 +2267,7 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
         requestor · duration · queue
         autoplay / shuffle / repeat / liked
         up next
-        divider   <- separates info from the button row below
+        divider   <- separates the card from the button row below
     """
     paused = player.is_paused
     total = track.duration
@@ -2283,7 +2285,7 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
     lines.append("")
 
     now_parts = [
-        f"👤  **{truncate(track.requested_by, 40)}**",
+        f"**{truncate(track.requested_by, 40)}**",
         f"⏱  {format_time(total) if total else 'Live'}",
         f"📀  {len(player.queue)} in queue",
     ]
@@ -2294,17 +2296,17 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
 
     status_bits = [f"♾️  Autoplay {'on' if player.autoplay else 'off'}"]
     if player.shuffle_enabled:
-        status_bits.append("🔀  Shuffle")
+        status_bits.append("Shuffle")
     if player.loop_mode == "song":
-        status_bits.append("🔂  Repeat one")
+        status_bits.append("Repeat one")
     elif player.loop_mode == "queue":
-        status_bits.append("🔁  Repeat all")
+        status_bits.append("Repeat all")
     if liked:
         status_bits.append("❤️  Liked")
     lines.append("  ·  ".join(status_bits))
 
     if player.queue:
-        lines.append(f"🎶  Up next · {truncate(player.queue[0].title, 80)}")
+        lines.append(f"🎶  Up next · **{truncate(player.queue[0].title, 80)}**")
 
     lines.append(DIVIDER)
 
@@ -2326,15 +2328,15 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
     quality = quality_label(track)
     if quality:
         footer.append(quality)
-    embed.set_footer(text="  ·  ".join(footer))
+    embed.set_footer(text="  ·  ".join(footer), icon_url=BRAND_ICON)
     return embed
 
 
 def build_idle_embed(reason: str) -> discord.Embed:
     """Final card state once playback has stopped or the queue ran out."""
     embed = discord.Embed(
-        title=reason,
-        description="Use `/play` to start listening again.",
+        title=f"⏹  {reason}",
+        description="Press `/play` or `/search` to start listening again.",
         colour=MUTED,
     )
     embed.set_author(name=f"🎵 {BRAND_NAME}", icon_url=BRAND_ICON)
@@ -3015,11 +3017,18 @@ class PlayerView(discord.ui.View):
         super().__init__(timeout=None)
         self.player = player
         self.retired = False
-        order = ("⏮️", "⏸️", "⏭️", "🔀", "🔁", "🛑", "🎵", "🤍", "🔗", "🔄", "🎤")
+        # Transport controls get their own row; secondary actions sit quietly in
+        # the middle row; the remaining utilities fill the last row so nothing is
+        # left as a lonely orphan button.
+        order = ("⏮️", "⏸️", "⏭️", "🛑", "🔀", "🔁", "🎵", "🤍", "🔗", "🔄", "🎤")
+        row_for = {
+            "⏮️": 0, "⏸️": 0, "⏭️": 0, "🛑": 0,
+            "🔀": 1, "🔁": 1, "🎵": 1, "🤍": 1,
+            "🔗": 2, "🔄": 2, "🎤": 2,
+        }
         priority = {emoji: index for index, emoji in enumerate(order)}
         for item in self.children:
-            index = priority.get(str(item.emoji), len(order))
-            item.row = 0 if index < 5 else 1 if index < 9 else 2
+            item.row = row_for.get(str(item.emoji), 2)
         ordered_items = sorted(
             self.children, key=lambda item: priority.get(str(item.emoji), len(order))
         )
@@ -3156,7 +3165,7 @@ class PlayerView(discord.ui.View):
                 text = "Nothing else is queued right now."
         await interaction.response.send_message(text, ephemeral=True)
 
-    @discord.ui.button(emoji="🔀", label="Shuffle", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="🔀", label="Shuffle", style=discord.ButtonStyle.secondary, row=1)
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3179,7 +3188,7 @@ class PlayerView(discord.ui.View):
             note = "🔀 Shuffle off"
         await interaction.followup.send(note, ephemeral=True)
 
-    @discord.ui.button(emoji="🔁", label="Repeat", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="🔁", label="Repeat", style=discord.ButtonStyle.secondary, row=1)
     async def repeat_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3201,7 +3210,7 @@ class PlayerView(discord.ui.View):
         }
         await interaction.followup.send(labels[player.loop_mode], ephemeral=True)
 
-    @discord.ui.button(emoji="🔗", label="Autoplay", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🔗", label="Autoplay", style=discord.ButtonStyle.secondary, row=2)
     async def autoplay_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3287,7 +3296,7 @@ class PlayerView(discord.ui.View):
                 return
             await self._edit_card(interaction)
 
-    @discord.ui.button(emoji="🛑", label="Stop", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(emoji="🛑", label="Stop", style=discord.ButtonStyle.danger, row=0)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3517,7 +3526,7 @@ class LikesView(discord.ui.View):
 def build_likes_embed(entries: list[LikedTrack]) -> discord.Embed:
     """The numbered list of liked songs shown by /likes."""
     embed = discord.Embed(
-        title=f"❤️ Your likes — {len(entries)}",
+        title=f"❤️ Liked Tracks — {len(entries)}",
         colour=TANGO_BLUE,
         timestamp=datetime.now(timezone.utc),
     )
@@ -3529,14 +3538,22 @@ def build_likes_embed(entries: list[LikedTrack]) -> discord.Embed:
     lines = []
     for index, item in enumerate(entries[:25], start=1):
         line = f"`{index:02d}`  **{truncate(item.title, 60)}**"
-        if item.artist:
-            line += f" — {truncate(item.artist, 30)}"
-        if item.duration:
-            line += f"  `{format_time(item.duration)}`"
+        bits = [
+            bit
+            for bit in (
+                truncate(item.artist, 30) if item.artist else "",
+                format_time(item.duration) if item.duration else "",
+            )
+            if bit
+        ]
+        if bits:
+            line += f"  ·  {' · '.join(bits)}"
         lines.append(line)
-    embed.description = "\n".join(lines) or "_No likes yet._"
+    embed.description = "\n".join(lines) or (
+        "_No liked tracks yet._\nPress 🤍 on a player card to save the current song here."
+    )
     if len(entries) > 25:
-        embed.set_footer(text=f"Showing 25 of {len(entries)}")
+        embed.set_footer(text=f"Showing 25 of {len(entries)}", icon_url=BRAND_ICON)
     return embed
 
 
@@ -3549,7 +3566,7 @@ def build_queue_pages(player: MusicPlayer, per_page: int = 10) -> list[discord.E
     for index in range(total_pages):
         chunk = entries[index * per_page : (index + 1) * per_page]
         embed = discord.Embed(
-            title=f"🎶 Queue — {len(entries)} track{'s' if len(entries) != 1 else ''}",
+            title="🎶 Music Queue",
             colour=TANGO_BLUE,
             timestamp=datetime.now(timezone.utc),
         )
@@ -3557,37 +3574,52 @@ def build_queue_pages(player: MusicPlayer, per_page: int = 10) -> list[discord.E
             embed.set_author(name=f"🎵 {BRAND_NAME} — QUEUE", icon_url=KAIST_LOGO_URL)
         else:
             embed.set_author(name=f"🎵 {BRAND_NAME} — QUEUE")
+
+        summary = f"**{len(entries)}** track{'s' if len(entries) != 1 else ''} queued"
+        if total_seconds:
+            summary += f" · ⏱ {format_time(total_seconds)} total"
+        embed.description = summary
+
         if player.current is not None:
-            now = f"**{truncate(player.current.title, 80)}**"
-            meta = [
+            now = f"▶  **{truncate(player.current.title, 80)}**"
+            bits = [
                 bit
                 for bit in (
                     truncate(player.current.artist, 40) if player.current.artist else "",
-                    player.current.duration_label(),
+                    format_time(player.current.duration) if player.current.duration else "",
                 )
                 if bit
             ]
-            if meta:
-                now += "\n" + "  ·  ".join(meta)
-            embed.add_field(name="🎧  Now playing", value=now, inline=False)
+            if bits:
+                now += "\n`   ` " + " · ".join(bits)
+            requester = getattr(player.current, "requested_by", None)
+            if requester:
+                now += f"\n`   ` ↳ {truncate(requester, 40)}"
+            embed.add_field(name="Now playing", value=now, inline=False)
+
         lines = []
         for offset, track in enumerate(chunk):
             position = index * per_page + offset + 1
             line = f"`{position:02d}`  **{truncate(track.title, 60)}**"
-            if track.artist:
-                line += f" — {truncate(track.artist, 30)}"
-            if track.duration:
-                line += f"  `{format_time(track.duration)}`"
+            bits = [
+                bit
+                for bit in (
+                    truncate(track.artist, 30) if track.artist else "",
+                    format_time(track.duration) if track.duration else "",
+                )
+                if bit
+            ]
+            if bits:
+                line += f"  ·  {' · '.join(bits)}"
             lines.append(line)
         embed.add_field(
-            name="📜  Up next",
-            value="\n".join(lines) if lines else "Nothing queued yet.",
+            name="Up next",
+            value="\n".join(lines) if lines else "_Queue is empty — use `/play` or `/search`._",
             inline=False,
         )
-        footer = f"Page {index + 1} / {total_pages}"
-        if total_seconds:
-            footer += f"  ·  ⏱ {format_time(total_seconds)} total"
-        embed.set_footer(text=footer)
+
+        footer = f"Page {index + 1} of {total_pages}"
+        embed.set_footer(text=footer, icon_url=BRAND_ICON)
         pages.append(embed)
     return pages
 
