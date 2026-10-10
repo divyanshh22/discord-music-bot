@@ -32,7 +32,7 @@ if not exist "%PY%" (
     )
 )
 
-"%PY%" -c "import discord, yt_dlp, nacl" >nul 2>&1
+"%PY%" -c "import discord, wavelink, aiohttp, yt_dlp, nacl" >nul 2>&1
 if errorlevel 1 (
     echo Installing missing packages...
     "%PY%" -m pip install -r requirements.txt

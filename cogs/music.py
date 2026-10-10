@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 
 import discord
 import aiohttp
+import wavelink
 from discord.ext import commands
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -31,6 +32,7 @@ from ytmusicapi import YTMusic
 
 import config
 import db
+from audio_files import signed_audio_url
 
 log = logging.getLogger("case")
 
@@ -230,8 +232,8 @@ def source_label(track: Track) -> str:
 
 
 def quality_label(track: Track) -> str | None:
-    """`320 kbps` when the source reports a bitrate."""
-    quality = track.quality or ("320k" if track.is_stream else None)
+    """Format metadata when the source actually supplies it."""
+    quality = track.quality
     if not quality:
         return None
     if quality.endswith("k") and quality[:-1].isdigit():
@@ -1295,7 +1297,7 @@ def find_song(query: str) -> Path | None:
 
 
 class Track:
-    """One item in the queue. A track is either a file in music/ or a stream resolved by yt-dlp. `source` is what gets handed to FFmpeg: a path for local files, a U..."""
+    """A queue item with provider metadata and an optional Lavalink Playable."""
 
     def __init__(
         self,
@@ -1317,6 +1319,8 @@ class Track:
         artist_ids: list[str] | None = None,
         album_id: str | None = None,
         resolved_at: float | None = None,
+        playable: wavelink.Playable | None = None,
+        local_path: Path | None = None,
     ):
         self.source = source
         self.title = title
@@ -1356,6 +1360,11 @@ class Track:
         # When the stream URL was minted, so a long queue can refresh an expired
         # one instead of asking FFmpeg to fail first.
         self.resolved_at = resolved_at
+        self.playable = playable
+        self.local_path = local_path
+        self.started_event = asyncio.Event()
+        self.playback_error: str | None = None
+        self.playback_started = False
 
     def cleanup(self) -> None:
         """Delete the temporary file backing this track, if there is one."""
@@ -1368,11 +1377,19 @@ class Track:
         self.temp_path = None
 
     @classmethod
-    def from_file(cls, path: Path, requested_by: str = "someone") -> Track:
+    def from_file(
+        cls,
+        path: Path,
+        requested_by: str = "someone",
+        *,
+        playable: wavelink.Playable | None = None,
+    ) -> Track:
         return cls(
             source=str(path),
             title=normalize(path.stem).title(),
             requested_by=requested_by,
+            playable=playable,
+            local_path=path,
         )
 
     @property
@@ -1980,21 +1997,101 @@ def _resolved_info_matches_candidate(info: dict, candidate: dict) -> bool:
 async def _resolve_youtube_candidate(
     candidate: dict, requested_by: str, requested_query: str
 ) -> Track:
-    """Resolve one ranked candidate while preserving its validated identity."""
+    """Resolve a ranked YouTube Music result through Lavalink by video id."""
     video_id = candidate.get("id") or _video_id_from_url(candidate.get("webpage_url"))
     url = candidate.get("webpage_url")
     if not url:
         raise LookupError("search result has no song URL")
-    info = await _youtube_extract(url)
-    if not info:
-        raise LookupError("YouTube returned no playable track for that result")
-    if not _resolved_info_matches_candidate(info, candidate):
-        raise LookupError("YouTube resolved a different song than the selected result")
-    track = _build_track(info, requested_query, requested_by, candidate=candidate)
-    if video_id and track.song_id != str(video_id):
-        raise LookupError("track identity changed during stream resolution")
-    track.requested_query = requested_query
-    return track
+    playable = await _load_lavalink_playable(url, expected_id=video_id)
+    if video_id and playable.identifier != str(video_id):
+        raise StreamResolveError(
+            "Lavalink resolved a different YouTube video than the selected search result."
+        )
+    return _track_from_playable(
+        playable, requested_by, requested_query, candidate=candidate
+    )
+
+
+def _lavalink_error_message(exc: Exception) -> str:
+    """Classify source failures without leaking signed URLs or auth values."""
+    if isinstance(exc, wavelink.LavalinkLoadException):
+        reason = f"{exc.error}: {exc.cause}"
+    else:
+        reason = str(exc).strip() or type(exc).__name__
+    reason = re.sub(
+        r"(?i)([?&](?:signature|token|refreshToken|visitorData)=)[^&\s]+",
+        r"\1[redacted]",
+        reason,
+    )[:200]
+    lowered = reason.lower()
+    if "sign in to confirm" in lowered or "not a bot" in lowered:
+        return (
+            "YouTube is asking the Lavalink server to verify it isn't a bot. "
+            "This can happen to datacenter IPs; OAuth or PO tokens may help but do not guarantee playback."
+        )
+    if any(phrase in lowered for phrase in ("video unavailable", "private video", "region")):
+        return f"The selected YouTube track is unavailable: {reason}"
+    if isinstance(exc, wavelink.LavalinkLoadException):
+        return f"Lavalink could not load the selected audio: {reason}"
+    return f"Lavalink playback service error ({type(exc).__name__}): {reason}"
+
+
+async def _load_lavalink_playable(
+    uri: str, *, expected_id: str | None = None
+) -> wavelink.Playable:
+    """Resolve one URL through Lavalink and reject playlist/wrong-video results."""
+    try:
+        loaded = await wavelink.Playable.search(uri, source=None)
+    except wavelink.LavalinkLoadException as exc:
+        raise StreamResolveError(_lavalink_error_message(exc)) from exc
+    except wavelink.WavelinkException as exc:
+        raise StreamResolveError(_lavalink_error_message(exc)) from exc
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        raise StreamResolveError(_lavalink_error_message(exc)) from exc
+
+    if isinstance(loaded, wavelink.Playlist):
+        tracks = loaded.tracks
+    else:
+        tracks = list(loaded)
+    if not tracks:
+        raise StreamResolveError("Lavalink returned no playable track for that URL.")
+
+    if expected_id:
+        for playable in tracks:
+            if playable.identifier == str(expected_id):
+                return playable
+        raise StreamResolveError(
+            "Lavalink resolved a different YouTube video than the selected search result."
+        )
+    return tracks[0]
+
+
+def _track_from_playable(
+    playable: wavelink.Playable,
+    requested_by: str,
+    requested_query: str,
+    *,
+    candidate: dict | None = None,
+) -> Track:
+    candidate = candidate or {}
+    webpage_url = candidate.get("webpage_url") or playable.uri
+    return Track(
+        source=playable.uri or webpage_url or "",
+        title=candidate.get("title") or playable.title,
+        requested_by=requested_by,
+        duration=candidate.get("duration") or (int(playable.length / 1000) if playable.length else None),
+        webpage_url=webpage_url,
+        artist=candidate.get("artist") or playable.author or None,
+        thumbnail=candidate.get("thumbnail") or playable.artwork,
+        song_id=candidate.get("id") or playable.identifier,
+        album=candidate.get("album") or getattr(playable.album, "name", None),
+        language=candidate.get("language"),
+        requested_query=requested_query,
+        artist_ids=candidate.get("artist_ids"),
+        album_id=candidate.get("album_id"),
+        resolved_at=time.monotonic(),
+        playable=playable,
+    )
 
 
 async def resolve_track(query: str, requested_by: str) -> Track:
@@ -2014,17 +2111,19 @@ async def resolve_track(query: str, requested_by: str) -> Track:
 
     path = find_song(query)
     if path is not None:
-        track = Track.from_file(path, requested_by)
+        try:
+            playable = await _load_lavalink_playable(signed_audio_url(path))
+        except (RuntimeError, ValueError) as exc:
+            raise StreamResolveError(str(exc)) from exc
+        track = Track.from_file(path, requested_by, playable=playable)
         track.requested_query = query
         return track
 
     if is_url(query):
         video_id = _video_id_from_url(query)
         if video_id:
-            info = await _youtube_extract(_music_watch_url(video_id))
-            track = _build_track(info, query, requested_by)
-            track.requested_query = query
-            return track
+            playable = await _load_lavalink_playable(_music_watch_url(video_id))
+            return _track_from_playable(playable, requested_by, query)
 
         if _jiosaavn_song_id(query):
             # Legacy: /likes rows saved before the migration still hold these.
@@ -2037,7 +2136,12 @@ async def resolve_track(query: str, requested_by: str) -> Track:
                 ) from exc
             if not info:
                 raise StreamResolveError("That JioSaavn link returned no playable track.")
-            track = _build_track(info, query, requested_by)
+            title = (info.get("title") or "").strip()
+            artist = (info.get("artist") or info.get("creator") or info.get("uploader") or "").strip()
+            if not title:
+                raise StreamResolveError("That JioSaavn link has no usable song title.")
+            search_query = f"{title} by {artist}" if artist else title
+            track = await resolve_track(search_query, requested_by)
             track.requested_query = query
             return track
 
@@ -2533,9 +2637,9 @@ def build_idle_embed(reason: str) -> discord.Embed:
 
 
 class MusicPlayer:
-    """Plays a queue of local files in one voice channel. One of these exists per guild while CASE is connected."""
+    """Owns Tango's queue and controls while Wavelink sends audio via Lavalink."""
 
-    def __init__(self, voice: discord.VoiceProtocol):
+    def __init__(self, voice: wavelink.Player):
         self.voice = voice
         self.queue: list[Track] = []
         self.current: Track | None = None
@@ -2577,14 +2681,17 @@ class MusicPlayer:
         self._now_task: asyncio.Task | None = None
         self._view: PlayerView | None = None
         self._card_finalized = False
+        self._start_future: asyncio.Future[bool] | None = None
+        self._end_future: asyncio.Future[str] | None = None
+        self._playback_error: str | None = None
 
     @property
     def is_playing(self) -> bool:
-        return self.voice.is_playing()
+        return self.voice.playing
 
     @property
     def is_paused(self) -> bool:
-        return self.voice.is_paused()
+        return self.voice.paused
 
     def start(self) -> None:
         """Make sure the playback loop is running. Safe to call repeatedly."""
@@ -2625,7 +2732,7 @@ class MusicPlayer:
             self.queue.append(track)
         self.start()
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         """Clear the queue and halt the playback loop. Does not disconnect."""
         if self._now_task and not self._now_task.done():
             self._now_task.cancel()
@@ -2641,7 +2748,13 @@ class MusicPlayer:
         if self._task and not self._task.done():
             self._task.cancel()
         self._task = None
-        self.voice.stop()
+        for future in (self._start_future, self._end_future):
+            if future is not None and not future.done():
+                future.cancel()
+        self._start_future = None
+        self._end_future = None
+        if self.voice.connected:
+            await self.voice.stop()
 
     async def retire_card(self, message: discord.Message | None, reason: str, delay: float = 0.0) -> None:
         """Turn the player card into a final idle state and disable its controls."""
@@ -2666,16 +2779,16 @@ class MusicPlayer:
 
     async def shutdown(self) -> None:
         """Stop everything and leave the voice channel."""
-        self.stop()
-        if self.voice.is_connected():
+        await self.stop()
+        if self.voice.connected:
             await self.voice.disconnect()
 
-    def skip(self) -> None:
+    async def skip(self) -> None:
         """Drop the current song. The playback loop picks up the next one."""
         self._skip_once = True
-        if self.voice.is_paused():
-            self.voice.resume()
-        self.voice.stop()
+        if self.voice.paused:
+            await self.voice.pause(False)
+        await self.voice.stop()
 
     def clear(self) -> None:
         self.queue.clear()
@@ -2684,38 +2797,26 @@ class MusicPlayer:
         random.shuffle(self.queue)
 
     def elapsed(self) -> int:
-        """Seconds played of the current track; freezes while the audio is paused."""
+        """Seconds played, from Lavalink's authoritative player position."""
         if self.current is None:
             return 0
-        base = self.current.start_offset or 0
-        if self.started_at is None:
-            return base
-        now = time.monotonic()
-        if self.voice.is_paused():
-            if self._paused_since is None:
-                self._paused_since = now
-            paused = self._paused_total + (now - self._paused_since)
-        else:
-            if self._paused_since is not None:
-                self._paused_total += now - self._paused_since
-                self._paused_since = None
-            paused = self._paused_total
-        return base + max(0, int(now - self.started_at - paused))
+        position = self.voice.position
+        return int(position / 1000) if position is not None else self.current.start_offset
 
     async def seek(self, seconds: int) -> bool:
-        """Restart the current track at `seconds`."""
-        if self.current is None or not self.voice.is_connected():
+        """Seek the current Lavalink track to `seconds`."""
+        if self.current is None or not self.voice.connected or not self.current.playable:
             return False
-        clip = await asyncio.to_thread(_cut_track, self.current, max(0, seconds))
-        if clip is None:
+        seconds = max(0, seconds)
+        try:
+            await self.voice.seek(seconds * 1000)
+        except (wavelink.WavelinkException, aiohttp.ClientError, discord.HTTPException, OSError) as exc:
+            log.warning("Lavalink seek failed for %s: %s", self.current.title, _lavalink_error_message(exc))
             return False
-        self._seek_pending = True
-        self._seek_replacement = clip
-        if seconds <= 0:
-            self.current.start_offset = 0
-        self.started_at = None
-
-        self.voice.stop()
+        self.current.start_offset = seconds
+        self.started_at = time.monotonic()
+        self._paused_total = 0.0
+        self._paused_since = None
         return True
 
     def _remember(self, track: Track) -> None:
@@ -2730,7 +2831,7 @@ class MusicPlayer:
         """Play each queued track until the queue runs out or we get stopped."""
         try:
             while self.queue:
-                if not self.voice.is_connected():
+                if not self.voice.connected:
                     log.info("voice dropped, stopping playback loop")
                     break
 
@@ -2747,7 +2848,7 @@ class MusicPlayer:
                     self.queue.insert(0, track)
                     continue
 
-                if not ok and track.is_stream and self.voice.is_connected():
+                if not ok and track.is_stream and self.voice.connected:
 
 
 
@@ -2783,17 +2884,26 @@ class MusicPlayer:
             self.current = None
 
 
-            if self.voice.is_connected() and not self.queue:
+            if self.voice.connected and not self.queue:
                 log.info("queue finished - staying in the voice channel")
 
     async def _refresh_stale_stream(self, track: Track) -> Track:
-        """Re-resolve a queued stream whose URL is probably expired.
-
-        Direct googlevideo links are good for a few hours, so a long queue can
-        easily outlive one. Refreshing before FFmpeg sees it keeps an expired
-        URL a cheap, clearly logged event instead of a mysterious playback
-        failure. The original is kept when the refresh itself fails.
-        """
+        """Refresh local signed URLs and old queued YouTube references before play."""
+        if track.local_path is not None:
+            try:
+                track.playable = await _load_lavalink_playable(
+                    signed_audio_url(track.local_path)
+                )
+                track.source = track.playable.uri or track.source
+            except Exception as exc:  # noqa: BLE001 - move on to the next queued item
+                track.playable = None
+                track.playback_error = _lavalink_error_message(exc)
+                log.warning(
+                    "could not refresh local audio %s: %s",
+                    track.title,
+                    _lavalink_error_message(exc),
+                )
+            return track
         if (
             not track.is_stream
             or track.temp_path
@@ -2817,69 +2927,90 @@ class MusicPlayer:
         return fresh
 
     async def _play_one(self, track: Track) -> bool:
-        """Start one track and wait for it to finish."""
+        """Ask Lavalink to start a track, then await its end event."""
         self.current = track
-        log.info("playing %s", track.title)
-
-        before_options = ""
-        if track.is_stream and not track.temp_path:
-
-
-
-            before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-            if track.headers:
-
-
-                pairs = [f"{key}: {value}" for key, value in track.headers.items()]
-                header_blob = "\r\n".join(pairs) + "\r\n"
-                before_options += " -headers " + shlex.quote(header_blob)
-
-        try:
-
-
-            source = discord.FFmpegOpusAudio(
-                track.source,
-                executable=find_ffmpeg(),
-                before_options=before_options,
+        track.started_event.clear()
+        track.playback_started = False
+        self._playback_error = None
+        if track.playable is None:
+            track.playback_error = (
+                track.playback_error or "This item has not been resolved by Lavalink."
             )
-        except Exception:
-            # Report failure, not success: the loop re-resolves the stream URL
-            # once for a stream (expired links) and simply moves on for a file.
-            log.exception("ffmpeg failed for %s", track.title)
-            self._notify(f"Couldn't play **{track.title}** - FFmpeg rejected that source.")
-            self.current = None
+            track.started_event.set()
+            self._notify(f"Couldn't start **{track.title}**: {track.playback_error}")
             return False
+        track.playback_error = None
 
-        errors: list[Exception | None] = []
+        loop = asyncio.get_running_loop()
+        self._start_future = loop.create_future()
+        self._end_future = loop.create_future()
         try:
-            self.voice.play(source, after=errors.append)
-        except discord.ClientException as exc:
-
-            log.warning("voice.play failed: %s", exc)
+            await self.voice.play(
+                track.playable,
+                start=(track.start_offset or 0) * 1000,
+                add_history=False,
+            )
+        except (wavelink.WavelinkException, aiohttp.ClientError, discord.HTTPException, OSError) as exc:
+            track.playback_error = _lavalink_error_message(exc)
+            track.started_event.set()
+            log.warning("Lavalink rejected %s: %s", track.title, track.playback_error)
+            self._notify(f"Couldn't play **{track.title}**: {track.playback_error}")
             self.current = None
+            self._start_future = None
+            self._end_future = None
             return False
 
+        try:
+            did_start = await asyncio.wait_for(
+                asyncio.shield(self._start_future), timeout=15
+            )
+        except asyncio.TimeoutError:
+            track.playback_error = "Lavalink did not confirm that playback started within 15 seconds."
+            track.started_event.set()
+            log.warning("playback start timed out for %s", track.title)
+            try:
+                await self.voice.stop()
+            except wavelink.WavelinkException:
+                log.debug("could not stop a track after start timeout", exc_info=True)
+            self._notify(f"Couldn't start **{track.title}**: {track.playback_error}")
+            self.current = None
+            self._start_future = None
+            self._end_future = None
+            return False
+        except StreamResolveError as exc:
+            track.playback_error = str(exc)
+            track.started_event.set()
+            self._notify(f"Couldn't play **{track.title}**: {track.playback_error}")
+            self.current = None
+            self._start_future = None
+            self._end_future = None
+            return False
 
+        if did_start:
+            self.started_at = time.monotonic()
+            self._paused_total = 0.0
+            self._paused_since = None
+            self._announce(track)
 
-        self.started_at = time.monotonic()
-        self._paused_total = 0.0
-        self._paused_since = None
-        self._announce(track)
-
-
-        while self.voice.is_playing() or self.voice.is_paused():
-            await asyncio.sleep(0.5)
-
-
-
-        await asyncio.sleep(0.2)
+        reason = await self._end_future
         self.started_at = None
+        self.current = None
+        self._start_future = None
+        self._end_future = None
 
-        error = errors[0] if errors else None
-        if error is not None:
-            log.warning("playback of %s ended early: %s", track.title, error)
-        else:
+        if track.playback_error or self._playback_error:
+            track.playback_error = track.playback_error or self._playback_error
+            log.warning("playback of %s failed: %s", track.title, track.playback_error)
+            self._notify(f"Couldn't play **{track.title}**: {track.playback_error}")
+            return False
 
+        if reason.lower() not in {"finished", "stopped"}:
+            track.playback_error = f"Lavalink ended playback ({reason})."
+            log.warning("playback of %s ended with reason %s", track.title, reason)
+            self._notify(f"Playback stopped for **{track.title}**: {track.playback_error}")
+            return False
+
+        if did_start:
             await db.log_play(
                 self.voice.guild.id,
                 track.title,
@@ -2889,12 +3020,72 @@ class MusicPlayer:
                 duration=track.duration,
             )
 
-        self.current = None
+        return reason.lower() == "finished" or reason.lower() == "stopped"
 
+    def _matches_lavalink_payload(self, payload: object) -> bool:
+        if getattr(payload, "player", None) is not self.voice or self.current is None:
+            return False
+        active = self.current.playable
+        incoming = getattr(payload, "track", None)
+        return bool(active and incoming and active.identifier == incoming.identifier)
 
-        if track.temp_path and self.loop_mode == "off":
-            track.cleanup()
-        return error is None
+    def handle_track_start(self, payload: object) -> None:
+        if not self._matches_lavalink_payload(payload):
+            return
+        assert self.current is not None
+        self.current.playback_started = True
+        self.current.started_event.set()
+        if self._start_future is not None and not self._start_future.done():
+            self._start_future.set_result(True)
+
+    def handle_track_end(self, payload: wavelink.TrackEndEventPayload) -> None:
+        if not self._matches_lavalink_payload(payload):
+            return
+        assert self.current is not None
+        self.current.started_event.set()
+        if self._start_future is not None and not self._start_future.done():
+            self._start_future.set_result(False)
+        if self._end_future is not None and not self._end_future.done():
+            self._end_future.set_result(payload.reason)
+
+    def handle_track_exception(self, payload: wavelink.TrackExceptionEventPayload) -> None:
+        if not self._matches_lavalink_payload(payload):
+            return
+        exception = payload.exception
+        message = str(getattr(exception, "message", None) or exception)
+        safe_error = _lavalink_error_message(RuntimeError(message))
+        self._playback_error = safe_error
+        assert self.current is not None
+        self.current.playback_error = safe_error
+        if self._start_future is not None and not self._start_future.done():
+            self.current.started_event.set()
+            self._start_future.set_exception(StreamResolveError(safe_error))
+        log.error("Lavalink track exception for %s: %s", self.current.title, safe_error)
+
+    def handle_track_stuck(self, payload: wavelink.TrackStuckEventPayload) -> None:
+        if not self._matches_lavalink_payload(payload):
+            return
+        self._playback_error = "Lavalink reported that the audio stream is stuck."
+        assert self.current is not None
+        self.current.playback_error = self._playback_error
+        self.current.started_event.set()
+        if self._start_future is not None and not self._start_future.done():
+            self._start_future.set_result(False)
+        if self._end_future is not None and not self._end_future.done():
+            self._end_future.set_result("stuck")
+        asyncio.create_task(self.voice.stop())
+
+    def handle_backend_disconnect(self, reason: str) -> None:
+        if self.current is None:
+            return
+        error = f"Lavalink disconnected during playback: {reason}"
+        self.current.playback_error = error
+        self._playback_error = error
+        self.current.started_event.set()
+        if self._start_future is not None and not self._start_future.done():
+            self._start_future.set_exception(StreamResolveError(error))
+        elif self._end_future is not None and not self._end_future.done():
+            self._end_future.set_result("loadFailed")
 
     def _apply_loop(self, track: Track) -> None:
         """Put a finished track back in the queue when looping is on."""
@@ -3026,7 +3217,7 @@ class MusicPlayer:
 
     async def _queue_autoplay(self, finished: Track) -> None:
         """Keep the music going with a genuinely related YouTube Music track."""
-        if not self.autoplay or not self.voice.is_connected():
+        if not self.autoplay or not self.voice.connected:
             return
         if self._autoplay_busy:
             return
@@ -3061,7 +3252,7 @@ class MusicPlayer:
             )
 
             # A listener may have queued something while we were fetching.
-            if self.queue or not self.autoplay or not self.voice.is_connected():
+            if self.queue or not self.autoplay or not self.voice.connected:
                 return
 
             track, stream_error = await self._first_related(ranked, finished)
@@ -3078,7 +3269,7 @@ class MusicPlayer:
                 return
 
             # Re-check after the (awaited) resolution: manual queues win.
-            if self.queue or not self.autoplay or not self.voice.is_connected():
+            if self.queue or not self.autoplay or not self.voice.connected:
                 track.cleanup()
                 return
 
@@ -3162,7 +3353,7 @@ class MusicPlayer:
         try:
             while (
                 self.current is track
-                and (self.voice.is_playing() or self.voice.is_paused())
+                and (self.voice.playing or self.voice.paused)
                 and not self._card_finalized
             ):
                 await asyncio.sleep(CARD_TICK)
@@ -3213,7 +3404,7 @@ def control_error(interaction: discord.Interaction, player: MusicPlayer | None) 
         return "Nothing is playing right now."
     guild = interaction.guild
     voice = guild.voice_client if guild else None
-    if voice is None or not voice.is_connected():
+    if voice is None or not getattr(voice, "connected", False):
         return "I'm not in a voice channel right now."
     channel = getattr(getattr(interaction.user, "voice", None), "channel", None)
     if channel != voice.channel:
@@ -3363,7 +3554,7 @@ class PlayerView(discord.ui.View):
                     )
                     return
             player.queue.insert(0, target)
-            player.skip()
+            await player.skip()
 
         text = f"⏮ **{truncate(target.title, 80)}**"
         if notice is not None:
@@ -3383,9 +3574,9 @@ class PlayerView(discord.ui.View):
                 await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
                 return
             if player.is_paused:
-                player.voice.resume()
+                await player.voice.pause(False)
             else:
-                player.voice.pause()
+                await player.voice.pause(True)
             await self._edit_card(interaction)
 
     @discord.ui.button(emoji="⏭️", label="Skip", style=discord.ButtonStyle.secondary, row=0)
@@ -3398,10 +3589,10 @@ class PlayerView(discord.ui.View):
         async with player.action_lock:
             if player.queue:
                 title = player.queue[0].title
-                player.skip()
+                await player.skip()
                 text = f"⏭ **{truncate(title, 80)}**"
             elif player.autoplay:
-                player.skip()
+                await player.skip()
                 text = "⏭ Skipped — autoplay is picking something similar…"
             else:
                 text = "Nothing else is queued right now."
@@ -3949,6 +4140,9 @@ class SearchPicker(discord.ui.View):
             )
         except asyncio.TimeoutError:
             await interaction.followup.send("That took too long to load. Try again.")
+        except StreamResolveError as exc:
+            log.warning("search picker stream failed for %r: %s", chosen.get("title"), exc)
+            await interaction.followup.send(str(exc))
         except ValueError as exc:
             await interaction.followup.send(str(exc))
         except (DownloadError, LookupError):
@@ -3989,14 +4183,17 @@ class Music(commands.Cog):
         if member is None:
             return None, "You're not in a voice channel."
 
-        if not ffmpeg_available():
-            return None, FFMPEG_MISSING
+        if not any(
+            node.status is wavelink.NodeStatus.CONNECTED
+            for node in wavelink.Pool.nodes.values()
+        ):
+            return None, "The audio server is unavailable right now. Try again shortly."
 
         voice = interaction.guild.voice_client
 
 
 
-        if voice is not None and not voice.is_connected():
+        if voice is not None and not getattr(voice, "connected", False):
             try:
                 await voice.disconnect(force=True)
             except Exception:
@@ -4007,19 +4204,28 @@ class Music(commands.Cog):
             connect_started = time.monotonic()
             try:
                 voice = await member.channel.connect(
-                    self_deaf=False, self_mute=False, timeout=20
+                    cls=wavelink.Player,
+                    self_deaf=True,
+                    self_mute=False,
+                    timeout=20,
                 )
                 log.info(
                     "voice connected to %s in %.1fs",
                     member.channel,
                     time.monotonic() - connect_started,
                 )
-            except (asyncio.TimeoutError, OSError, discord.ClientException) as exc:
+            except (
+                asyncio.TimeoutError,
+                OSError,
+                discord.ClientException,
+                discord.HTTPException,
+                wavelink.WavelinkException,
+            ) as exc:
                 log.warning(
-                    "voice connect failed after %.1fs (%s): %r",
+                    "voice connect failed after %.1fs (%s): %s",
                     time.monotonic() - connect_started,
                     type(exc).__name__,
-                    exc,
+                    reason_line(exc),
                 )
                 await self._discard_voice(interaction.guild)
                 return None, (
@@ -4029,7 +4235,12 @@ class Music(commands.Cog):
         elif voice.channel != member.channel:
             try:
                 await voice.move_to(member.channel)
-            except (OSError, discord.ClientException) as exc:
+            except (
+                OSError,
+                discord.ClientException,
+                discord.HTTPException,
+                wavelink.WavelinkException,
+            ) as exc:
                 log.warning("move_to failed: %s", exc, exc_info=exc)
                 await self._discard_voice(interaction.guild)
                 return None, "I couldn't join your voice channel. Try again."
@@ -4187,7 +4398,7 @@ class Music(commands.Cog):
         player.add(track)
 
         if was_idle:
-            await interaction.followup.send(f"Now playing **{track.title}**.")
+            await interaction.followup.send(f"Queued **{track.title}**. Starting audio...")
         else:
             await interaction.followup.send(
                 f"Added **{track.title}** to the queue - position {len(player.queue)}."
@@ -4207,7 +4418,7 @@ class Music(commands.Cog):
         if not player.is_playing:
             await interaction.response.send_message("Nothing is playing right now.")
             return
-        player.voice.pause()
+        await player.voice.pause(True)
         await interaction.response.send_message(f"Paused **{player.current.title}**.")
 
     @discord.app_commands.command(name="resume", description="Resume the paused song.")
@@ -4219,7 +4430,7 @@ class Music(commands.Cog):
         if not player.is_paused:
             await interaction.response.send_message("The music isn't paused.")
             return
-        player.voice.resume()
+        await player.voice.pause(False)
         await interaction.response.send_message(f"Resumed **{player.current.title}**.")
 
     @discord.app_commands.command(name="skip", description="Skip to the next song.")
@@ -4233,10 +4444,10 @@ class Music(commands.Cog):
 
         if player.queue:
             nxt = player.queue[0].title
-            player.skip()
+            await player.skip()
             await interaction.response.send_message(f"Skipped. Now playing **{nxt}**.")
         else:
-            player.skip()
+            await player.skip()
             if player.autoplay:
                 await interaction.response.send_message(
                     "Skipped. Autoplay is picking something similar..."
@@ -4311,7 +4522,7 @@ class Music(commands.Cog):
         if player.current is None:
             player.start()
         else:
-            player.skip()
+            await player.skip()
         await interaction.response.send_message(
             f"Jumped to **{target.title}**" + (f", dropped {dropped} song(s)." if dropped else ".")
         )
@@ -4470,7 +4681,7 @@ class Music(commands.Cog):
                     path = find_song(item.title)
                     if path is None:
                         raise ValueError("no local file matches")
-                    track = Track.from_file(path, interaction.user.display_name)
+                    track = await resolve_track(item.title, interaction.user.display_name)
             except Exception as exc:
                 # A like saved before the provider change holds a JioSaavn URL,
                 # which may be dead by now: fall back to the stored title.
@@ -4699,8 +4910,76 @@ class Music(commands.Cog):
         if member.id == self.bot.user.id and after.channel is None:
             player = self.players.get(member.guild.id)
             if player:
-                player.stop()
+                await player.stop()
                 del self.players[member.guild.id]
+
+    @commands.Cog.listener()
+    async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload):
+        voice = payload.player
+        if voice is None:
+            return
+        player = self.players.get(voice.guild.id)
+        if player is not None:
+            player.handle_track_start(payload)
+
+    @commands.Cog.listener()
+    async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
+        voice = payload.player
+        if voice is None:
+            return
+        player = self.players.get(voice.guild.id)
+        if player is not None:
+            player.handle_track_end(payload)
+
+    @commands.Cog.listener()
+    async def on_wavelink_track_exception(self, payload: wavelink.TrackExceptionEventPayload):
+        voice = payload.player
+        if voice is None:
+            return
+        player = self.players.get(voice.guild.id)
+        if player is not None:
+            player.handle_track_exception(payload)
+
+    @commands.Cog.listener()
+    async def on_wavelink_track_stuck(self, payload: wavelink.TrackStuckEventPayload):
+        voice = payload.player
+        if voice is None:
+            return
+        player = self.players.get(voice.guild.id)
+        if player is not None:
+            player.handle_track_stuck(payload)
+
+    @commands.Cog.listener()
+    async def on_wavelink_node_ready(self, payload: wavelink.NodeReadyEventPayload):
+        log.info(
+            "Lavalink node ready: %s (resumed=%s)",
+            payload.node.identifier,
+            payload.resumed,
+        )
+
+    @commands.Cog.listener()
+    async def on_wavelink_node_disconnected(
+        self, payload: wavelink.NodeDisconnectedEventPayload
+    ):
+        log.error("Lavalink node disconnected: %s", payload.node.identifier)
+        for player in self.players.values():
+            if player.voice.node is payload.node:
+                player.handle_backend_disconnect("the audio node disconnected")
+
+    @commands.Cog.listener()
+    async def on_wavelink_websocket_closed(self, payload: wavelink.WebsocketClosedEventPayload):
+        voice = payload.player
+        if voice is None:
+            return
+        log.warning(
+            "Discord voice websocket closed (code=%s, remote=%s): %s",
+            payload.code,
+            payload.by_remote,
+            payload.reason,
+        )
+        player = self.players.get(voice.guild.id)
+        if player is not None:
+            player.handle_backend_disconnect("Discord closed the voice websocket")
 
 
 async def setup(bot):

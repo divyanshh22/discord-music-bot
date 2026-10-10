@@ -4,11 +4,14 @@ import os
 from pathlib import Path
 
 import discord
+import wavelink
+from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 
 import config
 import db
+from audio_files import serve_local_audio
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s %(message)s")
 log = logging.getLogger("case")
@@ -17,39 +20,47 @@ log = logging.getLogger("case")
 
 intents = discord.Intents.default()
 
-client = commands.Bot(command_prefix="!", intents=intents)
+class TangoBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        if not config.LAVALINK_URI or not config.LAVALINK_PASSWORD:
+            raise RuntimeError("LAVALINK_URI and LAVALINK_PASSWORD must be set.")
+
+        node = wavelink.Node(
+            identifier="tango-lavalink",
+            uri=config.LAVALINK_URI,
+            password=config.LAVALINK_PASSWORD,
+            retries=2,
+        )
+        connected = await wavelink.Pool.connect(nodes=[node], client=self)
+        if node.identifier not in connected:
+            raise RuntimeError(
+                "Could not connect to Lavalink. Check LAVALINK_URI, the shared password, "
+                "and the Lavalink service logs."
+            )
+        log.info("Lavalink node connected: %s", node.identifier)
 
 
-async def start_health_server() -> None:
-    """Answer on $PORT so Render treats this as a healthy web service."""
+client = TangoBot(command_prefix="!", intents=intents)
+
+
+async def start_health_server() -> web.AppRunner | None:
+    """Serve Render health checks and short-lived local audio URLs."""
     if not config.PORT:
         return
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
+    async def health(_request: web.Request) -> web.Response:
+        return web.Response(text="Tango Music is online")
 
-
-            while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=5)
-                if not line or line in (b"\r\n", b"\n"):
-                    break
-            body = b"Audira is online"
-            writer.write(
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: text/plain\r\n"
-                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-                b"Connection: close\r\n"
-                b"\r\n" + body
-            )
-            await writer.drain()
-        except Exception:
-            pass
-        finally:
-            writer.close()
-
-    server = await asyncio.start_server(handle, "0.0.0.0", int(config.PORT))
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    app.router.add_get("/local-audio/{asset}", serve_local_audio)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(config.PORT))
+    await site.start()
     log.info("health server listening on port %s", config.PORT)
-    return server
+    return runner
 
 
 async def load_cogs():
@@ -104,15 +115,19 @@ async def on_command_error(ctx, error):
 
 
 async def main():
+    health_runner = None
     try:
         async with client:
             await load_cogs()
 
 
-            await start_health_server()
+            health_runner = await start_health_server()
             await db.connect(config.DATABASE_URL)
             await client.start(config.TOKEN)
     finally:
+        if health_runner is not None:
+            await health_runner.cleanup()
+        await wavelink.Pool.close()
         await db.close()
 
 

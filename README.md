@@ -9,7 +9,7 @@ Built for my own private server.
 
 - Join and leave voice channels
 - Play local audio files from the `music/` folder
-- Songs from YouTube Music: metadata from `ytmusicapi`, audio from yt-dlp
+- Songs from YouTube Music: metadata and ranking from `ytmusicapi`, playback through Lavalink v4
 - Paste a YouTube / YouTube Music link and it plays that exact video
 - Pause, resume, skip and stop
 - Per-server queue with automatic advance to the next song
@@ -25,11 +25,13 @@ Built for my own private server.
 
 - Python 3.11+
 - [discord.py](https://discordpy.readthedocs.io/) 2.x
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) for extraction and playback
+- [Wavelink](https://wavelink.readthedocs.io/) 3.5.2 for Lavalink v4
+- [Lavalink](https://github.com/lavalink-devs/Lavalink) 4.2.2 and the official YouTube source plugin 1.18.2
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) retained for search fallback and legacy JioSaavn metadata only; active audio playback uses Lavalink
 - [ytmusicapi](https://github.com/sigma67/ytmusicapi) for YouTube Music search
   and catalogue metadata
-- FFmpeg (external program, not a Python package)
-- Node.js 22+ (external program: yt-dlp needs it to solve YouTube's player JS)
+- FFmpeg is not required for active Lavalink playback
+- aiohttp for Render health checks and signed local-file streaming
 - python-dotenv
 
 ## Project structure
@@ -40,6 +42,8 @@ CASE/
 ├── config.py          # reads .env and exposes paths
 ├── requirements.txt
 ├── .env               # bot token (git-ignored)
+├── audio_files.py      # signed short-lived local-file URLs for Lavalink
+├── lavalink/           # Lavalink Dockerfile and server configuration
 ├── music/             # your local audio files go here
 └── cogs/
     ├── general.py     # /ping, /help
@@ -57,55 +61,11 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## FFmpeg setup
-
-FFmpeg is a standalone program that converts your `.mp3` into the Opus audio
-Discord accepts. `pip` cannot install it.
-
-**Windows:**
-
-1. Download a build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (`ffmpeg-release-essentials.zip`)
-2. Extract it somewhere permanent, e.g. `C:\ffmpeg`
-3. Add `C:\ffmpeg\bin` to your system `PATH` (System Properties → Environment Variables → Path → New)
-4. Open a **new** Command Prompt and check:
-
-```
-ffmpeg -version
-```
-
-If you see a version banner, it's working. Restart your IDE/terminal so it picks up the new PATH.
-
-**macOS / Linux:**
-
-```bash
-brew install ffmpeg          # macOS
-sudo apt install ffmpeg      # Debian/Ubuntu
-```
-
-## Node.js setup
-
-yt-dlp solves YouTube's player signature and `n` challenges with a JavaScript
-runtime. It wants **Node 22 or newer**; `cogs/music.py` looks for one on your
-`PATH` (and in `./node/bin/node`, which `render-build.sh` installs when needed)
-and logs the version it found at startup.
-
-```bash
-node --version                # v22.0.0 or newer
-```
-
-If it's older, install a newer one from [nodejs.org](https://nodejs.org/) (or
-`nvm install 22`). Without a supported runtime, some YouTube formats go missing
-and extraction gets flaky.
-
-Two optional yt-dlp add-ons are installed from `requirements.txt` and make a
-datacenter IP behave much better:
-
-- `yt-dlp-ejs` - the signature/n-sig solvers themselves, shipped as a pip
-  package so the build never has to download code from GitHub at runtime.
-- `bgutil-ytdlp-pot-provider` - mints YouTube proof-of-origin tokens locally.
-  The server half is cloned and compiled by `render-build.sh` (see below);
-  locally, `potprovider/` in this repo is already built and picked up
-  automatically.
+Legacy yt-dlp/FFmpeg helper code and dependencies remain in the repository
+until the Render smoke test is complete. yt-dlp is still used for search
+fallback and legacy JioSaavn metadata; neither yt-dlp nor FFmpeg is used by the
+active Lavalink `/play` audio path. There is no automatic FFmpeg playback
+fallback if Lavalink is unavailable.
 
 ## Discord bot setup
 
@@ -132,13 +92,21 @@ datacenter IP behave much better:
    | Speak | Send audio into the channel |
    | Use Voice Activity | Voice isn't flagged as screen-share activity |
 
-6. Put the token in `.env`:
+6. Put the bot token and local Lavalink connection in `.env`:
 
    ```env
    DISCORD_TOKEN=your_real_token_here
+  LAVALINK_URI=http://localhost:2333
+  LAVALINK_PASSWORD=the_same_random_password_used_by_lavalink
    ```
 
-   `.env` is in `.gitignore`. Never paste your token in chat or commit it.
+  Start a Lavalink service using `lavalink/application.yml` before starting
+  the bot. `.env` is in `.gitignore`. Never paste credentials into chat or
+  commit them.
+
+  If playing local files in `music/`, also set `PORT`,
+  `LAVALINK_LOCAL_AUDIO_BASE_URL` (the bot's address reachable from Lavalink),
+  and a separate random `LOCAL_AUDIO_SECRET`.
 
 ## Running
 
@@ -213,9 +181,8 @@ music/
 3. Otherwise the text is searched on YouTube Music, ranked against what you typed
    (title, artist, edition, duration, popularity), and only played when the top
    hit is confident - otherwise `/play` shows a picker.
-4. The chosen result is then extracted by yt-dlp (the player-client fallbacks are
-   tried in order) and checked against the ranking result by video id, so the
-   song that plays is the song that was validated.
+4. The selected YouTube URL is loaded through Lavalink's official YouTube source
+  plugin and checked against the ranked candidate by video id.
 
 ### When things fail
 
@@ -224,22 +191,48 @@ Errors are classified on purpose; the bot never turns one kind into another:
 - **Search itself is down / the IP is blocked** -> "YouTube Music search isn't
   available right now", with the real reason. Not "no results".
 - **Found, but no audio** (sign-in challenge, 403, unavailable video) -> a
-  `StreamResolveError` saying the track exists but wouldn't load. On a
-  datacenter IP the usual cause is YouTube asking the server to prove it isn't
-  a bot; the PO-token provider is there to make that rare, not impossible.
-- **Expired stream URL** (googlevideo links last a few hours) -> the queue
-  re-resolves the link once, automatically, and logs it.
+  `StreamResolveError` saying the track exists but wouldn't load. YouTube may
+  still challenge Render datacenter IPs when Lavalink resolves or plays a track.
+- **Lavalink disconnect or playback exception** -> the actual node/track error
+  is logged separately from YouTube Music search errors.
 - **Autoplay rails fail** -> they are skipped individually; a broken rail never
   disables autoplay or repeats the same failed track.
 
 ## Deploying to Render
 
-1. Push this repo to GitHub.
-2. On Render, create a **Web Service** from the repo (branch `main`).
-3. In your `.env` or as Render env vars: `DISCORD_TOKEN`. Add a
-   `DATABASE_URL` too if you want `/history` and `/likes`.
-4. Paste the build command below in **Settings → Build & Deploy**.
-5. Deploy. Render's health check passes because Audira listens on `$PORT`.
+The bot and Lavalink are separate Render services in the same workspace and
+region. Both services should use always-on plans for reliable playback; the
+private Lavalink service requires a paid Render plan.
+
+1. Create a **Private Service** from this repository, branch `main`, using the
+  Docker runtime. Leave Root Directory empty, set Dockerfile Path to
+  `lavalink/Dockerfile`, and use an always-on plan. Keep this service in the
+  same region as the bot.
+2. On the Lavalink service, set `LAVALINK_PASSWORD` to a long random secret.
+  The service listens privately on port `2333`; do not expose it publicly.
+3. Keep or create the bot's **Web Service** from branch `main`. Set Build
+  Command to `bash render-build.sh` and Start Command to `python bot.py`.
+4. Set these bot-service environment variables:
+
+  - `DISCORD_TOKEN`: existing Discord bot token.
+  - `LAVALINK_URI`: `http://<Lavalink service internal address>:2333`, using
+    the address shown in that service's **Connect → Internal** panel.
+  - `LAVALINK_PASSWORD`: the same value as on the Lavalink service.
+  - `LAVALINK_LOCAL_AUDIO_BASE_URL`: the bot web service's internal HTTP address
+    (for example, `http://<bot internal address>:10000`) so Lavalink can read
+    files in `music/`.
+  - `LOCAL_AUDIO_SECRET`: a separate long random secret used to sign
+    short-lived local-file URLs.
+  - `DATABASE_URL`: optional, only for `/history` and persisted likes.
+
+  If the bot web service is on Render Free, it cannot receive private-network
+  traffic. In that case set `LAVALINK_LOCAL_AUDIO_BASE_URL` to the bot's public
+  HTTPS `onrender.com` URL; local file requests remain protected by the signed
+  expiring URL. If you do not use local files, the two local-audio variables
+  are not needed.
+
+5. Deploy Lavalink first, then the bot. Lavalink downloads the pinned YouTube
+  plugin at startup from the official Lavalink Maven repository.
 
 ### Render build
 
@@ -247,29 +240,36 @@ Errors are classified on purpose; the bot never turns one kind into another:
 bash render-build.sh
 ```
 
-Put `bash render-build.sh` as the service's **Build Command** (Settings →
-Build & Deploy). The script:
+That existing script still installs the bot dependencies and legacy yt-dlp
+helpers. It does not build Lavalink; the private service builds from
+`lavalink/Dockerfile`.
 
-- installs `requirements.txt` (yt-dlp, yt-dlp-ejs, ytmusicapi, the PO-token
-  provider plugin, ...)
-- checks for Node 22+ (Render's native runtime already ships Node; if its
-  version is too old the script downloads a local copy into `./node`, which
-  the bot picks up)
-- clones and compiles the bgutil PO-token server (`potprovider/`) so yt-dlp
-  can mint proof-of-origin tokens from a datacenter IP. This step is
-  best-effort: if it fails, the build still succeeds and the logs say so.
+### Optional YouTube authentication
 
-Verify after the first deploy (Render's log stream, in order):
+The official plugin supports environment-backed `YOUTUBE_PO_TOKEN` and
+`YOUTUBE_VISITOR_DATA`, or OAuth with `YOUTUBE_OAUTH_ENABLED=true` and
+`YOUTUBE_OAUTH_REFRESH_TOKEN`. Leave OAuth disabled unless you deliberately
+configure it. The plugin warns that OAuth can cause rate limits or account
+termination; use a dedicated burner account, never a personal account. PO
+tokens apply only to the documented Web clients. Neither method guarantees
+playback or prevents Render IP restrictions. Do not paste tokens into source,
+commit them, or include them in support logs.
 
-1. `node.js: ... (v22.x)` - a supported runtime was found
-2. `ffmpeg: /usr/bin/ffmpeg` - Render pre-installs it
-3. `po-token provider: .../potprovider/server ...` - the helper was built
-4. In the bot log or `/version`: the new build string
+### Render verification checklist
 
-Free-tier caveats: the web service spins down after ~15 min of no HTTP
-traffic, and the free Postgres database expires after 30 days. More
-importantly for audio bots: **a free-tier IP is shared and datacenter-hosted**,
-which is exactly the kind of IP YouTube sometimes challenges. The build above
-mitigates that (PO token + JS solvers), but it cannot promise it away - if
-playback is refused, the logs will say so honestly rather than claiming the
-song doesn't exist.
+1. Lavalink logs show version `4.2.2`, the YouTube plugin `1.18.2` loaded, and
+  the node listening on port `2333`.
+2. Bot logs show `Lavalink node connected: tango-lavalink`; `/version` reports
+  Wavelink `3.5.2`.
+3. Try `/search Those Eyes by New West`, then `/play Those Eyes by New West`.
+  Confirm metadata is ranked first and a Lavalink track-start event appears.
+4. Test `/pause`, `/resume`, `/seek`, `/skip`, `/queue`, `/loop`, `/autoplay`,
+  `/stop`, `/join`, and `/leave`.
+5. Test `music/` playback if using local files; confirm the Lavalink service can
+  reach the configured signed local-audio URL.
+
+Search, resolver, event, and control tests in this repository are mocked; they
+do not prove that the Render services can reach Discord voice or that YouTube
+will allow a particular datacenter IP. If the plugin reports a bot challenge,
+Lavalink, client choice, OAuth, or a PO token cannot guarantee a fix; use a
+legitimate alternative audio source if YouTube continues to block the host.

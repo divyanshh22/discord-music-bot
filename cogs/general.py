@@ -2,6 +2,7 @@ import platform
 import sys
 
 import discord
+import wavelink
 from discord.ext import commands
 import yt_dlp
 import ytmusicapi
@@ -40,7 +41,7 @@ class General(commands.Cog):
             name="Runtime",
             value=(
                 f"Python {platform.python_version()} · discord.py {discord.__version__} · "
-                f"yt-dlp {yt_dlp.version.__version__} · "
+                f"Wavelink {wavelink.__version__} · yt-dlp {yt_dlp.version.__version__} · "
                 f"ytmusicapi {getattr(ytmusicapi, '__version__', '?')}"
             ),
             inline=False,

@@ -183,6 +183,18 @@ def make_candidate(title, artist, video_id, language="english", album=None):
     }
 
 
+def make_playable(video_id, title="Song", author="Artist"):
+    return types.SimpleNamespace(
+        identifier=video_id,
+        uri=watch(video_id),
+        title=title,
+        author=author,
+        length=200_000,
+        artwork=None,
+        album=types.SimpleNamespace(name=None),
+    )
+
+
 # --- Base helper ---------------------------------------------------------
 
 
@@ -445,23 +457,13 @@ class ResolveTrackTests(PatchedTestCase):
         super().setUp()
         self.extracted = []
 
-        def fake_extract(_opts, url):
+        async def fake_load(url, expected_id=None):
             self.extracted.append(url)
             if vid("failstream") in url:
-                raise RuntimeError("stream unavailable")
-            return {"webpage_url": url, "url": "http://media"}
+                raise m.StreamResolveError("stream unavailable")
+            return make_playable(expected_id or m._video_id_from_url(url) or vid("local"))
 
-        def fake_build(info, query, requested_by, *, candidate=None):
-            candidate = candidate or {}
-            return m.Track(
-                source=info.get("url") or "http://media",
-                title=info.get("title") or query,
-                requested_by=requested_by,
-                webpage_url=info.get("webpage_url"),
-                song_id=candidate.get("id"),
-            )
-
-        self.patch(_extract_once=fake_extract, _build_track=fake_build)
+        self.patch(_load_lavalink_playable=fake_load)
 
     def run_resolve(self, query):
         return asyncio.run(m.resolve_track(query, "tester"))
@@ -495,13 +497,13 @@ class ResolveTrackTests(PatchedTestCase):
              "score": 0.9, "signals": {"artist_hint": True, "artist_mismatch": False}},
         ])
 
-        def fail_first(_opts, url):
+        async def fail_first(url, expected_id=None):
             self.extracted.append(url)
             if vid("first") in url:
-                raise RuntimeError("first stream unavailable")
-            return {"webpage_url": url, "url": "http://media"}
+                raise m.StreamResolveError("first stream unavailable")
+            return make_playable(expected_id or m._video_id_from_url(url))
 
-        self.patch(_extract_once=fail_first)
+        self.patch(_load_lavalink_playable=fail_first)
         track = self.run_resolve("Flashing Lights Kanye West")
         self.assertEqual(
             self.extracted,
@@ -581,16 +583,13 @@ class ResolveTrackTests(PatchedTestCase):
         }
         self.patch(search_candidates=lambda q, limit=5: [original, cover])
 
-        def fail_original(_opts, url):
+        async def fail_original(url, expected_id=None):
             self.extracted.append(url)
             if vid("original") in url:
-                raise RuntimeError("original stream unavailable")
-            return {
-                "title": "Flashing Lights", "artist": "Kanye West",
-                "webpage_url": url, "url": "http://media",
-            }
+                raise m.StreamResolveError("original stream unavailable")
+            return make_playable(expected_id or m._video_id_from_url(url), "Flashing Lights", "Kanye West")
 
-        self.patch(_extract_once=fail_original)
+        self.patch(_load_lavalink_playable=fail_original)
         with self.assertRaises(m.StreamResolveError):
             self.run_resolve("Flashing Lights by Kanye West")
         self.assertEqual(self.extracted, [original["webpage_url"]])
@@ -610,11 +609,11 @@ class ResolveTrackTests(PatchedTestCase):
         }
         self.patch(search_candidates=lambda q, limit=5: [original, unrelated])
 
-        def fail_original(_opts, url):
+        async def fail_original(url, expected_id=None):
             self.extracted.append(url)
-            raise RuntimeError("original stream unavailable")
+            raise m.StreamResolveError("original stream unavailable")
 
-        self.patch(_extract_once=fail_original)
+        self.patch(_load_lavalink_playable=fail_original)
         with self.assertRaises(m.StreamResolveError):
             self.run_resolve("Flashing Lights")
         self.assertEqual(self.extracted, [original["webpage_url"]])
@@ -628,15 +627,11 @@ class ResolveTrackTests(PatchedTestCase):
         }
         self.patch(search_candidates=lambda q, limit=5: [candidate])
 
-        def return_different_track(_opts, url):
+        async def return_different_track(url, expected_id=None):
             self.extracted.append(url)
-            return {
-                "title": "Unrelated Song", "artist": "Different Artist",
-                "webpage_url": watch(vid("other-video")),
-                "url": "http://media",
-            }
+            return make_playable(vid("other-video"), "Unrelated Song", "Different Artist")
 
-        self.patch(_extract_once=return_different_track)
+        self.patch(_load_lavalink_playable=return_different_track)
         with self.assertRaises(m.StreamResolveError):
             self.run_resolve("Those Eyes by New West")
         self.assertEqual(self.extracted, [candidate["webpage_url"]])
@@ -850,11 +845,11 @@ class ResolveUrlTests(PatchedTestCase):
     def test_youtube_music_url_plays_that_video(self):
         seen: list[str] = []
 
-        async def fake_extract(url):
+        async def fake_load(url, expected_id=None):
             seen.append(url)
-            return {"webpage_url": url, "url": "http://media", "title": "Those Eyes"}
+            return make_playable(expected_id or m._video_id_from_url(url), "Those Eyes", "New West")
 
-        self.patch(_youtube_extract=fake_extract)
+        self.patch(_load_lavalink_playable=fake_load)
         track = self.run_resolve("https://music.youtube.com/watch?v=GDND88fqt1o")
         self.assertEqual(seen, ["https://music.youtube.com/watch?v=GDND88fqt1o"])
         self.assertEqual(track.song_id, "GDND88fqt1o")
@@ -863,11 +858,11 @@ class ResolveUrlTests(PatchedTestCase):
     def test_short_link_is_normalised_to_a_watch_url(self):
         seen: list[str] = []
 
-        async def fake_extract(url):
+        async def fake_load(url, expected_id=None):
             seen.append(url)
-            return {"webpage_url": url, "url": "http://media", "title": "Those Eyes"}
+            return make_playable(expected_id or m._video_id_from_url(url), "Those Eyes", "New West")
 
-        self.patch(_youtube_extract=fake_extract)
+        self.patch(_load_lavalink_playable=fake_load)
         track = self.run_resolve("https://youtu.be/GDND88fqt1o?t=10")
         self.assertEqual(seen, ["https://music.youtube.com/watch?v=GDND88fqt1o"])
         self.assertEqual(track.song_id, "GDND88fqt1o")
@@ -899,12 +894,21 @@ class ResolveUrlTests(PatchedTestCase):
 
     def test_legacy_jiosaavn_url_still_plays_when_it_works(self):
         def fake_extract(_opts, url):
-            return {"webpage_url": url, "url": "http://media", "title": "Khat"}
+            return {"webpage_url": url, "title": "Khat", "artist": "Navjot Ahuja"}
 
         self.patch(_extract_once=fake_extract)
+        self.patch(search_candidates=lambda query, limit=5: [
+            {"id": vid("khat"), "title": "Khat", "artist": "Navjot Ahuja",
+             "webpage_url": watch(vid("khat")), "score": 1.0,
+             "signals": {"artist_hint": True, "artist_mismatch": False}},
+        ])
+        async def fake_load(url, expected_id=None):
+            return make_playable(expected_id or vid("khat"), "Khat", "Navjot Ahuja")
+
+        self.patch(_load_lavalink_playable=fake_load)
         track = self.run_resolve("https://www.jiosaavn.com/song/khat/OSMIAyZ1Wws")
         self.assertEqual(track.title, "Khat")
-        self.assertEqual(track.song_id, "OSMIAyZ1Wws")
+        self.assertEqual(track.song_id, vid("khat"))
 
 
 class YoutubeErrorMessageTests(unittest.TestCase):
