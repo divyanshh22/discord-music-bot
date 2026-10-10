@@ -76,6 +76,7 @@ class General(commands.Cog):
                 "`/loop off|song|queue` — repeat\n"
                 "`/autoplay` — keep playing similar songs\n"
                 "`/nowplaying` — current song with progress\n"
+                "`/likes` — your liked songs (with Play all)\n"
                 "`/history` — recently played songs"
             ),
             inline=False,

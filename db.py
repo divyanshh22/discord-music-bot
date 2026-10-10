@@ -28,6 +28,24 @@ SCHEMA = (
     CREATE INDEX IF NOT EXISTS play_history_guild_time
         ON play_history (guild_id, played_at DESC)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS liked_tracks (
+        id         BIGSERIAL PRIMARY KEY,
+        guild_id   BIGINT  NOT NULL,
+        user_id    BIGINT  NOT NULL,
+        identity   TEXT    NOT NULL,
+        title      TEXT    NOT NULL,
+        url        TEXT,
+        artist     TEXT,
+        duration   INTEGER,
+        added_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (guild_id, user_id, identity)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS liked_tracks_guild_user
+        ON liked_tracks (guild_id, user_id, added_at DESC)
+    """,
 )
 
 
@@ -124,4 +142,103 @@ async def recent_plays(guild_id: int, limit: int = 10) -> list[asyncpg.Record]:
         )
     except Exception:
         log.warning("could not read play history", exc_info=True)
+        return []
+
+
+async def save_like(
+    guild_id: int,
+    user_id: int,
+    identity: str,
+    *,
+    title: str,
+    url: str | None = None,
+    artist: str | None = None,
+    duration: int | None = None,
+) -> None:
+    """Remember (or refresh) a liked track for one user in one server."""
+    if _pool is None:
+        return
+
+    try:
+        await _pool.execute(
+            """
+            INSERT INTO liked_tracks (guild_id, user_id, identity, title, url, artist, duration)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (guild_id, user_id, identity) DO UPDATE
+            SET title = EXCLUDED.title,
+                url = EXCLUDED.url,
+                artist = EXCLUDED.artist,
+                duration = EXCLUDED.duration
+            """,
+            guild_id,
+            user_id,
+            identity,
+            title,
+            url,
+            artist,
+            duration,
+        )
+    except Exception:
+        log.warning("could not save like %r", title, exc_info=True)
+
+
+async def remove_like(guild_id: int, user_id: int, identity: str) -> None:
+    """Forget a liked track for one user in one server."""
+    if _pool is None:
+        return
+
+    try:
+        await _pool.execute(
+            "DELETE FROM liked_tracks WHERE guild_id = $1 AND user_id = $2 AND identity = $3",
+            guild_id,
+            user_id,
+            identity,
+        )
+    except Exception:
+        log.warning("could not remove like %r", identity, exc_info=True)
+
+
+async def user_likes(
+    guild_id: int, user_id: int, limit: int = 100
+) -> list[asyncpg.Record]:
+    """Newest-first liked tracks for one user. Empty list when no database."""
+    if _pool is None:
+        return []
+
+    try:
+        return await _pool.fetch(
+            """
+            SELECT identity, title, url, artist, duration, added_at
+            FROM liked_tracks
+            WHERE guild_id = $1 AND user_id = $2
+            ORDER BY added_at DESC
+            LIMIT $3
+            """,
+            guild_id,
+            user_id,
+            limit,
+        )
+    except Exception:
+        log.warning("could not read liked tracks", exc_info=True)
+        return []
+
+
+async def guild_likes(guild_id: int, limit: int = 1000) -> list[asyncpg.Record]:
+    """Every liked track a server knows about (used for the shared card heart)."""
+    if _pool is None:
+        return []
+
+    try:
+        return await _pool.fetch(
+            """
+            SELECT identity, user_id, title, url, artist, duration
+            FROM liked_tracks
+            WHERE guild_id = $1
+            LIMIT $2
+            """,
+            guild_id,
+            limit,
+        )
+    except Exception:
+        log.warning("could not read server likes", exc_info=True)
         return []
