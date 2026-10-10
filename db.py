@@ -231,7 +231,7 @@ async def guild_likes(guild_id: int, limit: int = 1000) -> list[asyncpg.Record]:
     try:
         return await _pool.fetch(
             """
-            SELECT identity, user_id, title, url, artist, duration
+            SELECT identity, user_id, title, url, artist, duration, added_at
             FROM liked_tracks
             WHERE guild_id = $1
             LIMIT $2

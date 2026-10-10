@@ -1260,6 +1260,7 @@ class LikedTrack:
     """A song a user liked (see /likes). Keyed per user per server."""
 
     title: str
+    identity: str | None = None
     url: str | None = None
     artist: str | None = None
     duration: int | None = None
@@ -2407,19 +2408,23 @@ class MusicPlayer:
         """One-time pull of this server's saved likes from the database."""
         if self._likes_loaded:
             return
-        self._likes_loaded = True
         if not db.available():
+            self._likes_loaded = True
             return
-        rows = await db.guild_likes(self.voice.guild.id)
-        for row in rows:
-            liked = LikedTrack(
-                title=row["title"],
-                url=row["url"],
-                artist=row["artist"],
-                duration=row["duration"],
-                added_at=row["added_at"],
-            )
-            self.liked.setdefault(row["identity"], {})[row["user_id"]] = liked
+        try:
+            rows = await db.guild_likes(self.voice.guild.id)
+            for row in rows:
+                liked = LikedTrack(
+                    title=row["title"],
+                    url=row["url"],
+                    artist=row["artist"],
+                    duration=row["duration"],
+                    added_at=row["added_at"],
+                )
+                self.liked.setdefault(row["identity"], {})[row["user_id"]] = liked
+        except Exception:
+            log.warning("could not load server likes", exc_info=True)
+        self._likes_loaded = True
 
     def add(self, track: Track) -> None:
         """Queue a track; with shuffle on it lands at a random position."""
@@ -3409,16 +3414,130 @@ class QueuePager(discord.ui.View):
 
 
 class LikesView(discord.ui.View):
-    """Attached to /likes so the list can be queued in one tap."""
+    """Attached to /likes: pick a song to play it or remove it, or queue all."""
 
-    def __init__(self, cog: "Music"):
+    def __init__(
+        self,
+        cog: "Music",
+        guild_id: int,
+        user_id: int,
+        entries: list[LikedTrack],
+    ):
         super().__init__(timeout=180)
         self.cog = cog
-        self.pressed = False
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.entries = entries
+        self.selected: int | None = None
 
-    @discord.ui.button(emoji="▶️", label="Play all", style=discord.ButtonStyle.primary, row=0)
+        options = [
+            discord.SelectOption(
+                label=f"{index}. {truncate(item.title, 90)}",
+                value=str(index),
+            )
+            for index, item in enumerate(entries[:25])
+        ]
+        select = discord.ui.Select(
+            placeholder="Pick a liked song…",
+            options=options,
+            row=0,
+        )
+
+        async def _choose(interaction: discord.Interaction):
+            self.selected = int(select.values[0])
+            await interaction.response.edit_message(view=self)
+
+        select.callback = _choose
+        self._select = select
+        self.add_item(select)
+
+    def _picked(self, interaction: discord.Interaction) -> LikedTrack | None:
+        """The selected liked track, or None (with a nudge) when nothing is picked."""
+        if self.selected is not None and 0 <= self.selected < len(self.entries):
+            return self.entries[self.selected]
+        return None
+
+    def _refresh_embed(self) -> discord.Embed:
+        """Rebuild the /likes embed (and picker numbers) for the current entries."""
+        options = [
+            discord.SelectOption(
+                label=f"{index}. {truncate(item.title, 90)}",
+                value=str(index),
+            )
+            for index, item in enumerate(self.entries[:25])
+        ]
+        self._select.options = options
+        return build_likes_embed(self.entries)
+
+    @discord.ui.button(emoji="▶️", label="Play", style=discord.ButtonStyle.primary, row=1)
+    async def play_one(self, interaction: discord.Interaction, button: discord.ui.Button):
+        item = self._picked(interaction)
+        if item is None:
+            await interaction.response.send_message(
+                "Pick a song from the list first.", ephemeral=True
+            )
+            return
+        await self.cog.play_liked(interaction, [item])
+
+    @discord.ui.button(emoji="🗑️", label="Remove", style=discord.ButtonStyle.danger, row=1)
+    async def remove_one(self, interaction: discord.Interaction, button: discord.ui.Button):
+        item = self._picked(interaction)
+        if item is None:
+            await interaction.response.send_message(
+                "Pick a song from the list first.", ephemeral=True
+            )
+            return
+        self.entries.remove(item)
+        self.selected = None
+        identity = item.identity or ""
+        asyncio.create_task(db.remove_like(self.guild_id, self.user_id, identity))
+        guild = interaction.guild
+        player = self.cog.get_player(guild) if guild is not None else None
+        if player is not None:
+            users = player.liked.get(identity)
+            if users is not None:
+                users.pop(self.user_id, None)
+                if not users:
+                    player.liked.pop(identity, None)
+        if not self.entries:
+            embed = build_likes_embed([])
+            await interaction.response.edit_message(embed=embed, view=None)
+            self.stop()
+            return
+        await interaction.response.edit_message(
+            embed=self._refresh_embed(),
+            view=self,
+        )
+
+    @discord.ui.button(emoji="▶️", label="Play all", style=discord.ButtonStyle.secondary, row=2)
     async def play_all(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.cog.play_likes(interaction)
+        await self.cog.play_liked(interaction, self.entries[:25])
+
+
+def build_likes_embed(entries: list[LikedTrack]) -> discord.Embed:
+    """The numbered list of liked songs shown by /likes."""
+    embed = discord.Embed(
+        title=f"❤️ Your likes — {len(entries)}",
+        colour=TANGO_BLUE,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if KAIST_LOGO_URL:
+        embed.set_author(name=f"🎵 {BRAND_NAME} — YOUR LIKES", icon_url=KAIST_LOGO_URL)
+    else:
+        embed.set_author(name=f"🎵 {BRAND_NAME} — YOUR LIKES")
+
+    lines = []
+    for index, item in enumerate(entries[:25], start=1):
+        line = f"`{index:02d}`  **{truncate(item.title, 60)}**"
+        if item.artist:
+            line += f" — {truncate(item.artist, 30)}"
+        if item.duration:
+            line += f"  `{format_time(item.duration)}`"
+        lines.append(line)
+    embed.description = "\n".join(lines) or "_No likes yet._"
+    if len(entries) > 25:
+        embed.set_footer(text=f"Showing 25 of {len(entries)}")
+    return embed
 
 
 def build_queue_pages(player: MusicPlayer, per_page: int = 10) -> list[discord.Embed]:
@@ -3900,6 +4019,48 @@ class Music(commands.Cog):
             view=view,
         )
 
+    async def _collect_likes(
+        self, guild: discord.Guild, user_id: int
+    ) -> list[LikedTrack]:
+        """Newest-first liked tracks for one user, each tagged with its identity."""
+        player = self.get_player(guild)
+        if player is not None:
+            await player.load_likes()
+            entries = []
+            for identity, users in player.liked.items():
+                item = users.get(user_id)
+                if item is None:
+                    continue
+                entries.append(
+                    LikedTrack(
+                        identity=identity,
+                        title=item.title,
+                        url=item.url,
+                        artist=item.artist,
+                        duration=item.duration,
+                        added_at=item.added_at,
+                    )
+                )
+            entries.sort(
+                key=lambda item: item.added_at or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+            return entries
+        if db.available():
+            rows = await db.user_likes(guild.id, user_id)
+            return [
+                LikedTrack(
+                    identity=row["identity"],
+                    title=row["title"],
+                    url=row["url"],
+                    artist=row["artist"],
+                    duration=row["duration"],
+                    added_at=row["added_at"],
+                )
+                for row in rows
+            ]
+        return []
+
     @discord.app_commands.command(name="likes", description="Show the songs you've liked.")
     async def likes(self, interaction: discord.Interaction):
         guild = interaction.guild
@@ -3908,33 +4069,7 @@ class Music(commands.Cog):
                 "This only works inside a server.", ephemeral=True
             )
             return
-        user_id = interaction.user.id
-        player = self.get_player(guild)
-        if player is not None:
-            await player.load_likes()
-            entries = [
-                users[user_id]
-                for users in player.liked.values()
-                if user_id in users
-            ]
-            entries.sort(
-                key=lambda item: item.added_at or datetime.min.replace(tzinfo=timezone.utc),
-                reverse=True,
-            )
-        elif db.available():
-            rows = await db.user_likes(guild.id, user_id)
-            entries = [
-                LikedTrack(
-                    title=row["title"],
-                    url=row["url"],
-                    artist=row["artist"],
-                    duration=row["duration"],
-                    added_at=row["added_at"],
-                )
-                for row in rows
-            ]
-        else:
-            entries = []
+        entries = await self._collect_likes(guild, interaction.user.id)
 
         if not entries:
             await interaction.response.send_message(
@@ -3943,63 +4078,20 @@ class Music(commands.Cog):
             )
             return
 
-        embed = discord.Embed(
-            title=f"❤️ Your likes — {len(entries)}",
-            colour=TANGO_BLUE,
-            timestamp=datetime.now(timezone.utc),
+        await interaction.response.send_message(
+            embed=build_likes_embed(entries),
+            view=LikesView(self, guild.id, interaction.user.id, entries),
         )
-        if KAIST_LOGO_URL:
-            embed.set_author(name=f"🎵 {BRAND_NAME} — YOUR LIKES", icon_url=KAIST_LOGO_URL)
-        else:
-            embed.set_author(name=f"🎵 {BRAND_NAME} — YOUR LIKES")
 
-        lines = []
-        for index, item in enumerate(entries[:25], start=1):
-            line = f"`{index:02d}`  **{truncate(item.title, 60)}**"
-            if item.artist:
-                line += f" — {truncate(item.artist, 30)}"
-            if item.duration:
-                line += f"  `{format_time(item.duration)}`"
-            lines.append(line)
-        embed.description = "\n".join(lines)
-        if len(entries) > 25:
-            embed.set_footer(text=f"Showing 25 of {len(entries)}")
-        await interaction.response.send_message(embed=embed, view=LikesView(self))
-
-    async def play_likes(self, interaction: discord.Interaction) -> None:
-        """Queue every song the user has liked in this server."""
+    async def play_liked(
+        self, interaction: discord.Interaction, entries: list[LikedTrack]
+    ) -> None:
+        """Queue a set of liked songs. Shared by the Play / Play-all buttons."""
         guild = interaction.guild
         await interaction.response.defer()
         if guild is None:
             await interaction.followup.send("This only works inside a server.", ephemeral=True)
             return
-        user_id = interaction.user.id
-        player = self.get_player(guild)
-        if player is not None:
-            await player.load_likes()
-            entries = [
-                users[user_id]
-                for users in player.liked.values()
-                if user_id in users
-            ]
-            entries.sort(
-                key=lambda item: item.added_at or datetime.min.replace(tzinfo=timezone.utc),
-                reverse=True,
-            )
-        elif db.available():
-            rows = await db.user_likes(guild.id, user_id)
-            entries = [
-                LikedTrack(
-                    title=row["title"],
-                    url=row["url"],
-                    artist=row["artist"],
-                    duration=row["duration"],
-                    added_at=row["added_at"],
-                )
-                for row in rows
-            ]
-        else:
-            entries = []
 
         if not entries:
             await interaction.followup.send(
@@ -4007,7 +4099,6 @@ class Music(commands.Cog):
             )
             return
 
-        entries = entries[:25]
         player, error = await self.ensure_player(interaction)
         if error:
             await interaction.followup.send(error)
@@ -4036,6 +4127,16 @@ class Music(commands.Cog):
         if failed:
             reply += f" Couldn't play **{failed}**."
         await interaction.followup.send(reply)
+
+    async def play_likes(self, interaction: discord.Interaction) -> None:
+        """Back-compat helper: queue every song the user has liked in this server."""
+        guild = interaction.guild
+        entries = (
+            await self._collect_likes(guild, interaction.user.id)
+            if guild is not None
+            else []
+        )
+        await self.play_liked(interaction, entries[:25])
 
     @discord.app_commands.command(name="seek", description="Jump to a spot in the current song.")
     async def seek(self, interaction: discord.Interaction, position: str):
