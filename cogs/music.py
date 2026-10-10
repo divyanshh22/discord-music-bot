@@ -3991,14 +3991,29 @@ class Music(commands.Cog):
             voice = None
 
         if voice is None:
-            try:
-                voice = await member.channel.connect(
-                    self_deaf=False, self_mute=False, timeout=30
+            # Datacenter IPs (Render etc.) often need more than the library's
+            # default 30s for the voice handshake; one retry covers a first-attempt
+            # blip without leaving the user staring at a spinner.
+            last_exc: Exception | None = None
+            for attempt in range(2):
+                try:
+                    voice = await member.channel.connect(
+                        self_deaf=False, self_mute=False, timeout=60
+                    )
+                    last_exc = None
+                    break
+                except (asyncio.TimeoutError, OSError, discord.ClientException) as exc:
+                    last_exc = exc
+                    log.warning(
+                        "voice connect attempt %d failed: %s", attempt + 1, exc
+                    )
+                    await self._discard_voice(interaction.guild)
+            if last_exc is not None:
+                log.warning("voice connect failed after retry: %s", last_exc)
+                return None, (
+                    "I couldn't join your voice channel. Discord's voice servers "
+                    "can be slow from cloud hosts - try again in a few seconds."
                 )
-            except (asyncio.TimeoutError, OSError, discord.ClientException) as exc:
-                log.warning("voice connect failed: %s", exc, exc_info=exc)
-                await self._discard_voice(interaction.guild)
-                return None, "I couldn't join your voice channel. Try again."
         elif voice.channel != member.channel:
             try:
                 await voice.move_to(member.channel)
@@ -4124,7 +4139,7 @@ class Music(commands.Cog):
         """Connect, queue `track`, and reply. Caller must have deferred. Shared by /play and /search so both behave identically."""
         try:
             player, error = await asyncio.wait_for(
-                self.ensure_player(interaction), timeout=40
+                self.ensure_player(interaction), timeout=130
             )
         except asyncio.TimeoutError:
             log.warning("voice connect timed out for %r", label)
