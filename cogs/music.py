@@ -148,6 +148,7 @@ def parse_timestamp(text: str) -> int:
 ACCENT = discord.Colour.from_rgb(99, 102, 241)
 MUTED = discord.Colour.from_rgb(96, 100, 112)
 BRAND_ICON = "https://cdn-icons-png.flaticon.com/512/2361/2361845.png"
+KAIST_LOGO_URL = os.getenv("KAIST_LOGO_URL", "").strip()
 CARD_TICK = 1.5
 
 # Now-playing card look. Discord renders the title blue when the embed has a URL,
@@ -2290,7 +2291,11 @@ def build_now_playing_embed(track: Track, player: MusicPlayer) -> discord.Embed:
         description="\n".join(lines),
         colour=TANGO_BLUE,
     )
-    embed.set_author(name=f"🎵 {BRAND_NAME} — NOW PLAYING", icon_url=BRAND_ICON)
+    author_name = f"🎵 {BRAND_NAME} — NOW PLAYING"
+    if KAIST_LOGO_URL:
+        embed.set_author(name=author_name, icon_url=KAIST_LOGO_URL)
+    else:
+        embed.set_author(name=author_name)
     if track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
 
@@ -2943,6 +2948,18 @@ class PlayerView(discord.ui.View):
         super().__init__(timeout=None)
         self.player = player
         self.retired = False
+        order = ("⏮️", "⏸️", "⏭️", "🔀", "🔁", "🛑", "🎵", "🤍", "🔗", "🔄", "🎤")
+        priority = {emoji: index for index, emoji in enumerate(order)}
+        for item in self.children:
+            index = priority.get(str(item.emoji), len(order))
+            item.row = 0 if index < 5 else 1 if index < 9 else 2
+        ordered_items = sorted(
+            self.children, key=lambda item: priority.get(str(item.emoji), len(order))
+        )
+        for item in tuple(self.children):
+            self.remove_item(item)
+        for item in ordered_items:
+            self.add_item(item)
 
     def sync(self) -> None:
         """Reflect the live playback state on every button."""
@@ -2951,6 +2968,7 @@ class PlayerView(discord.ui.View):
         self.prev_btn.disabled = not active or not player.history
         self.play_btn.disabled = not active
         self.play_btn.emoji = "▶️" if player.is_paused else "⏸️"
+        self.play_btn.label = "Play" if player.is_paused else "Pause"
         self.next_btn.disabled = not active or not (player.queue or player.autoplay)
         self.stop_btn.disabled = not active and not player.queue
 
@@ -2965,6 +2983,11 @@ class PlayerView(discord.ui.View):
             else discord.ButtonStyle.secondary
         )
         self.repeat_btn.emoji = "🔂" if player.loop_mode == "song" else "🔁"
+        self.repeat_btn.label = {
+            "off": "Repeat",
+            "song": "Repeat song",
+            "queue": "Repeat queue",
+        }.get(player.loop_mode, "Repeat")
         self.autoplay_btn.style = (
             discord.ButtonStyle.success
             if player.autoplay
@@ -2992,7 +3015,7 @@ class PlayerView(discord.ui.View):
         else:
             await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="⏮️", label="Prev", style=discord.ButtonStyle.secondary, row=0)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3030,7 +3053,7 @@ class PlayerView(discord.ui.View):
         else:
             await interaction.response.send_message(text, ephemeral=True)
 
-    @discord.ui.button(emoji="⏸️", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(emoji="⏸️", label="Pause", style=discord.ButtonStyle.primary, row=0)
     async def play_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3047,7 +3070,7 @@ class PlayerView(discord.ui.View):
                 player.voice.pause()
             await self._edit_card(interaction)
 
-    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="⏭️", label="Skip", style=discord.ButtonStyle.secondary, row=0)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3066,7 +3089,7 @@ class PlayerView(discord.ui.View):
                 text = "Nothing else is queued right now."
         await interaction.response.send_message(text, ephemeral=True)
 
-    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🔀", label="Shuffle", style=discord.ButtonStyle.secondary, row=0)
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3089,7 +3112,7 @@ class PlayerView(discord.ui.View):
             note = "🔀 Shuffle off"
         await interaction.followup.send(note, ephemeral=True)
 
-    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🔁", label="Repeat", style=discord.ButtonStyle.secondary, row=0)
     async def repeat_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3111,7 +3134,7 @@ class PlayerView(discord.ui.View):
         }
         await interaction.followup.send(labels[player.loop_mode], ephemeral=True)
 
-    @discord.ui.button(emoji="♾️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🔗", label="Autoplay", style=discord.ButtonStyle.secondary, row=1)
     async def autoplay_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3133,7 +3156,7 @@ class PlayerView(discord.ui.View):
         else:
             await interaction.followup.send("♾️ Autoplay **off**.", ephemeral=True)
 
-    @discord.ui.button(emoji="🤍", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🤍", label="Like", style=discord.ButtonStyle.secondary, row=1)
     async def like_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3162,7 +3185,7 @@ class PlayerView(discord.ui.View):
                 f"🤍 Removed **{truncate(track.title, 60)}** from your likes.", ephemeral=True
             )
 
-    @discord.ui.button(emoji="🔄", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(emoji="🔄", label="Restart", style=discord.ButtonStyle.secondary, row=2)
     async def restart_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3177,7 +3200,7 @@ class PlayerView(discord.ui.View):
                 return
             await self._edit_card(interaction)
 
-    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(emoji="🛑", label="Stop", style=discord.ButtonStyle.danger, row=1)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3214,7 +3237,7 @@ class PlayerView(discord.ui.View):
 
         asyncio.create_task(_release())
 
-    @discord.ui.button(emoji="📜", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(emoji="🎵", label="Queue", style=discord.ButtonStyle.secondary, row=1)
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)
@@ -3227,7 +3250,7 @@ class PlayerView(discord.ui.View):
         pager.message = await interaction.original_response()
         pager.sync_state()
 
-    @discord.ui.button(emoji="🎵", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(emoji="🎤", label="Lyrics", style=discord.ButtonStyle.secondary, row=2)
     async def lyrics_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = self.player
         error = control_error(interaction, player)

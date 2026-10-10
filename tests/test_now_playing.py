@@ -79,6 +79,18 @@ class NowPlayingEmbedTests(unittest.TestCase):
         embed = m.build_now_playing_embed(self.track, self.player)
         self.assertEqual(embed.author.name, "🎵 TANGO — NOW PLAYING")
 
+    def test_kaist_logo_uses_only_the_configured_image_url(self):
+        original = m.KAIST_LOGO_URL
+        try:
+            m.KAIST_LOGO_URL = "https://assets.example/kaist-mark.png"
+            embed = m.build_now_playing_embed(self.track, self.player)
+            self.assertEqual(embed.author.icon_url, m.KAIST_LOGO_URL)
+            m.KAIST_LOGO_URL = ""
+            embed = m.build_now_playing_embed(self.track, self.player)
+            self.assertIsNone(embed.author.icon_url)
+        finally:
+            m.KAIST_LOGO_URL = original
+
     def test_title_is_a_blue_link_to_the_source(self):
         embed = m.build_now_playing_embed(self.track, self.player)
         self.assertEqual(embed.title, "Song")
@@ -175,28 +187,65 @@ class PlayerViewTests(unittest.TestCase):
         _player, view = self.make()
         rows = self.rows(view)
         self.assertEqual(
-            [self.emoji(c) for c in rows[0]], ["⏮️", "⏸️", "⏭️", "⏹️"]
+            [self.emoji(c) for c in rows[0]], ["⏮️", "⏸️", "⏭️", "🔀", "🔁"]
         )
         self.assertEqual(
-            [self.emoji(c) for c in rows[1]], ["🔀", "🔁", "♾️", "🤍"]
+            [self.emoji(c) for c in rows[1]], ["🛑", "🎵", "🤍", "🔗"]
         )
         self.assertEqual(
-            [self.emoji(c) for c in rows[2]], ["🔄", "📜", "🎵"]
+            [self.emoji(c) for c in rows[2]], ["🔄", "🎤"]
         )
+
+    def test_controls_have_compact_native_text_labels(self):
+        _player, view = self.make(current=StubTrack())
+        labels = [child.label for child in view.children]
+        self.assertEqual(
+            labels,
+            ["Prev", "Pause", "Skip", "Shuffle", "Repeat", "Stop", "Queue", "Like",
+             "Autoplay", "Restart", "Lyrics"],
+        )
+
+    def test_controls_keep_their_original_callbacks(self):
+        _player, view = self.make(current=StubTrack())
+        callbacks = {
+            child.label: child.callback.callback.__name__ for child in view.children
+        }
+        self.assertEqual(
+            callbacks,
+            {
+                "Prev": "prev_btn",
+                "Pause": "play_btn",
+                "Skip": "next_btn",
+                "Shuffle": "shuffle_btn",
+                "Repeat": "repeat_btn",
+                "Stop": "stop_btn",
+                "Queue": "queue_btn",
+                "Like": "like_btn",
+                "Autoplay": "autoplay_btn",
+                "Restart": "restart_btn",
+                "Lyrics": "lyrics_btn",
+            },
+        )
+
+    def test_play_label_reflects_current_playback_state(self):
+        _player, playing = self.make(current=StubTrack())
+        self.assertEqual(self.find(playing, "⏸️").label, "Pause")
+        _player, paused = self.make(current=StubTrack(), paused=True)
+        self.assertEqual(self.find(paused, "▶️").label, "Play")
 
     def test_stop_is_red_and_play_is_primary(self):
         _player, view = self.make(current=StubTrack())
-        stop = self.find(view, "⏹️")
+        stop = self.find(view, "🛑")
         play = self.find(view, "⏸️")
         self.assertEqual(stop.style, discord.ButtonStyle.danger)
         self.assertEqual(play.style, discord.ButtonStyle.primary)
 
     def test_autoplay_is_highlighted_when_enabled(self):
         _player, off = self.make(current=StubTrack(), autoplay=False)
-        self.assertEqual(self.find(off, "♾️").style, discord.ButtonStyle.secondary)
+        self.assertEqual(self.find(off, "🔗").style, discord.ButtonStyle.secondary)
 
         _player, on = self.make(current=StubTrack(), autoplay=True)
-        self.assertEqual(self.find(on, "♾️").style, discord.ButtonStyle.success)
+        self.assertEqual(self.find(on, "🔗").style, discord.ButtonStyle.success)
 
     def test_like_highlights_only_for_liked_tracks(self):
         track = StubTrack(song_id="ABC")
@@ -212,8 +261,8 @@ class PlayerViewTests(unittest.TestCase):
 
     def test_transport_disabled_when_idle(self):
         _player, view = self.make()
-        for child in self.rows(view)[0]:
-            self.assertTrue(child.disabled)
+        for glyph in ("⏮️", "⏸️", "⏭️"):
+            self.assertTrue(self.find(view, glyph).disabled)
 
 
 if __name__ == "__main__":
