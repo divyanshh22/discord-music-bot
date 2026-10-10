@@ -29,8 +29,8 @@ class StubTrack:
         self.artist = "Artist"
         self.requested_by = "someone"
         self.duration = 200
-        self.webpage_url = "https://www.jiosaavn.com/song/song/TOKEN"
-        self.thumbnail = "https://c.saavncdn.com/cover-500x500.jpg"
+        self.webpage_url = "https://music.youtube.com/watch?v=TOKEN123456"
+        self.thumbnail = "https://i.ytimg.com/vi/TOKEN123456/w120-h120.jpg"
         self.quality = "320k"
         self.song_id = "TOKEN"
         self.album = "Album"
@@ -132,8 +132,17 @@ class NowPlayingEmbedTests(unittest.TestCase):
     def test_footer_reports_status_source_and_quality(self):
         embed = m.build_now_playing_embed(self.track, self.player)
         self.assertIn("Playing", embed.footer.text)
-        self.assertIn("JioSaavn", embed.footer.text)
+        self.assertIn("YouTube Music", embed.footer.text)
         self.assertIn("320 kbps", embed.footer.text)
+
+    def test_legacy_jiosaavn_track_still_labels_the_source(self):
+        legacy = StubTrack(
+            webpage_url="https://www.jiosaavn.com/song/song/TOKEN",
+            thumbnail="https://c.saavncdn.com/cover-500x500.jpg",
+        )
+        player = StubPlayer(current=legacy)
+        embed = m.build_now_playing_embed(legacy, player)
+        self.assertIn("JioSaavn", embed.footer.text)
 
     def test_paused_footer(self):
         self.player._paused = True

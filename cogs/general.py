@@ -4,6 +4,7 @@ import sys
 import discord
 from discord.ext import commands
 import yt_dlp
+import ytmusicapi
 
 import config
 
@@ -39,7 +40,8 @@ class General(commands.Cog):
             name="Runtime",
             value=(
                 f"Python {platform.python_version()} · discord.py {discord.__version__} · "
-                f"yt-dlp {yt_dlp.version.__version__}"
+                f"yt-dlp {yt_dlp.version.__version__} · "
+                f"ytmusicapi {getattr(ytmusicapi, '__version__', '?')}"
             ),
             inline=False,
         )
@@ -87,7 +89,7 @@ class General(commands.Cog):
             inline=False,
         )
         embed.set_footer(
-            text="/play searches JioSaavn or plays a matching file from music/."
+            text="/play searches YouTube Music or plays a matching file from music/."
         )
         await interaction.response.send_message(embed=embed)
 

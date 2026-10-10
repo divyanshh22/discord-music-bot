@@ -20,13 +20,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
 import discord
 import aiohttp
 from discord.ext import commands
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
+from ytmusicapi import YTMusic
 
 import config
 import db
@@ -86,27 +87,29 @@ def ffmpeg_available() -> bool:
 
 
 def find_node() -> str | None:
-    """Locate node.js, which yt-dlp needs to unlock YouTube's signatures."""
+    """Locate Node.js 22+, which yt-dlp needs to unlock YouTube's player JS."""
+    candidates: list[Path] = []
     found = shutil.which("node")
     if found:
-        return found
+        candidates.append(Path(found))
 
     for folder in (
         Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "nodejs",
         Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "nodejs",
         Path("C:/Program Files/nodejs"),
     ):
-        candidate = Path(folder, "node.exe")
-        if candidate.exists():
-            return str(candidate)
+        candidates.append(Path(folder, "node.exe"))
 
-    for candidate in (
-        config.BASE_DIR / "node" / "bin" / "node",
-        config.BASE_DIR / "potprovider" / "server" / "node" / "bin" / "node",
-    ):
-        if candidate.exists():
-            return str(candidate)
+    candidates.extend(
+        (
+            config.BASE_DIR / "node" / "bin" / "node",
+            config.BASE_DIR / "potprovider" / "server" / "node" / "bin" / "node",
+        )
+    )
 
+    for candidate in candidates:
+        if candidate.exists() and _node_supported(str(candidate)):
+            return str(candidate)
     return None
 
 
@@ -119,6 +122,29 @@ def _node_version(path: str) -> str:
         return (out.stdout or out.stderr).strip() or "unknown version"
     except Exception:
         return "unknown version"
+
+
+# yt-dlp refuses runtimes older than this for YouTube (its EJS provider needs 22+).
+NODE_MIN_VERSION = (22, 0, 0)
+
+
+def _node_version_tuple(path: str) -> tuple[int, ...]:
+    """(22, 4, 0) from `node --version`, or () when it can't be read."""
+    text = _node_version(path).lstrip("vV").strip()
+    parts: list[int] = []
+    for chunk in text.split("."):
+        if not chunk.isdigit():
+            break
+        parts.append(int(chunk))
+    return tuple(parts[:3])
+
+
+def _node_supported(path: str) -> bool:
+    """True when this node binary is new enough for YouTube extraction."""
+    version = _node_version_tuple(path)
+    if not version:
+        return False
+    return version >= NODE_MIN_VERSION
 
 
 def normalize(text: str) -> str:
@@ -192,7 +218,9 @@ def progress_line(elapsed: int, total: int, width: int = 16) -> str:
 def source_label(track: Track) -> str:
     """Where the audio is coming from, for the card metadata line."""
     page = (track.webpage_url or "").lower()
-    if "youtube" in page:
+    if "music.youtube.com" in page:
+        return "YouTube Music"
+    if "youtube" in page or "youtu.be" in page:
         return "YouTube"
     if "jiosaavn" in page:
         return "JioSaavn"
@@ -406,21 +434,25 @@ UNSUPPORTED_DOMAINS = {
     ),
 }
 
-JIOSAAVN_API = "https://www.jiosaavn.com/api.php"
-JIOSAAVN_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-)
-JIOSAAVN_TIMEOUT = 15.0
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtube-nocookie.com",
+    "youtu.be",
+}
+
+# Seconds a ytmusicapi call may take before it is abandoned.
+YTM_TIMEOUT = 15.0
 MAX_POOL = 25
 
-# How many candidates a single JioSaavn search may return and how many we keep
+# How many candidates a single search may return and how many we keep
 # once several relaxed queries have been pooled together.
 SEARCH_EARLY_STOP = 8
 
 
 class _TTLCache:
-    """A tiny thread-safe cache. JioSaavn metadata barely changes, so caching
+    """A tiny thread-safe cache. Song metadata barely changes, so caching
     search results and entity lookups avoids duplicate network calls."""
 
     def __init__(self, ttl_seconds: float, maxsize: int = 256):
@@ -452,37 +484,75 @@ _TRACK_CACHE = _TTLCache(300)
 _DETAIL_CACHE = _TTLCache(600)
 
 
-def _saavn_get(call: str, params: dict, *, v4: bool = False, timeout: float = JIOSAAVN_TIMEOUT, retries: int = 2):
-    """Call JioSaavn's api.php with limited retries. Blocking; run it in a thread."""
-    base = {"_format": "json", "_method": "get", "__call": call}
-    if v4:
-        base.update({"_marker": "0", "api_version": "4", "ctx": "web6dot0"})
-    base.update(params)
-    url = f"{JIOSAAVN_API}?{urlencode(base)}"
+# --- YouTube Music provider -----------------------------------------------
+#
+# Search goes through ytmusicapi (YouTube Music's own web API - no key, no
+# account), with yt-dlp's `ytsearch` as an explicit, logged fallback when that
+# API is unreachable. Playback always goes through yt-dlp, which needs Node 22+
+# for the player JS and optionally the PO-token helper on a datacenter IP.
 
-    last: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            request = urllib.request.Request(
-                url, headers={"User-Agent": JIOSAAVN_UA, "Accept": "application/json"}
-            )
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.load(response)
-        except Exception as exc:  # noqa: BLE001 - retried below
-            last = exc
-            if attempt < retries:
-                time.sleep(0.6 * (attempt + 1))
-    raise last if last is not None else LookupError("JioSaavn request failed")
+YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+_ytm_client: YTMusic | None = None
+_ytm_lock = threading.Lock()
 
 
-def _thumb(url: str | None) -> str | None:
+def _ytm() -> YTMusic:
+    """Shared ytmusicapi client. Building one does no network I/O."""
+    global _ytm_client
+    with _ytm_lock:
+        if _ytm_client is None:
+            _ytm_client = YTMusic()
+        return _ytm_client
+
+
+def _youtube_host(host: str | None) -> str:
+    host = (host or "").lower().split(":")[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def is_youtube_url(url: str | None) -> bool:
+    """True for a YouTube or YouTube Music link yt-dlp can treat as one video."""
+    if not url:
+        return False
+    try:
+        host = _youtube_host(urlparse(url).netloc)
+    except Exception:
+        return False
+    return host in YOUTUBE_HOSTS
+
+
+def _video_id_from_url(url: str | None) -> str | None:
+    """The 11-character video id behind a watch / youtu.be / shorts / embed link."""
     if not url:
         return None
-    return re.sub(r"\d+x\d+", "500x500", url)
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    host = _youtube_host(parsed.netloc)
+    if host not in YOUTUBE_HOSTS:
+        return None
+
+    video_id = ""
+    if host == "youtu.be":
+        video_id = (parsed.path or "").lstrip("/").split("/")[0]
+    else:
+        video_id = (urllib.parse.parse_qs(parsed.query).get("v") or [""])[0]
+        if not video_id:
+            parts = [p for p in (parsed.path or "").split("/") if p]
+            if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live", "v", "e"}:
+                video_id = parts[1]
+    return video_id if YT_ID_RE.match(video_id) else None
+
+
+def _music_watch_url(video_id: str) -> str:
+    """The YouTube Music link for one video: what we show and re-resolve."""
+    return f"https://music.youtube.com/watch?v={video_id}"
 
 
 def _jiosaavn_song_id(url: str | None) -> str | None:
-    """The perma-url token for a JioSaavn song, e.g. .../song/khat/OSMIAyZ1Wws -> OSMIAyZ1Wws."""
+    """Legacy: the perma-url token for a JioSaavn song, e.g. .../song/khat/OSMIAyZ1Wws -> OSMIAyZ1Wws."""
     if not url:
         return None
     try:
@@ -496,117 +566,181 @@ def _jiosaavn_song_id(url: str | None) -> str | None:
     return parts[-1] if parts else None
 
 
-def _normalize_song_item(item: dict) -> dict | None:
-    """Turn one JioSaavn song object (v3 search or v4 entity shape) into our candidate dict."""
+def _parse_count(value) -> int:
+    """`"829M"` / `5900` / `"1.2K views"` -> an integer count, 0 when unknown."""
+    if value in (None, ""):
+        return 0
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    match = re.match(
+        r"([\d.]+)\s*([kmb])?", str(value).strip().replace(",", ""), re.I
+    )
+    if not match:
+        return 0
+    try:
+        number = float(match.group(1))
+    except ValueError:
+        return 0
+    scale = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}.get(
+        (match.group(2) or "").lower(), 1
+    )
+    return int(number * scale)
+
+
+def _parse_duration(value) -> int | None:
+    """`"3:41"` / `221` / `"1:02:03"` -> seconds."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) or None
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text) or None
+    if ":" not in text:
+        return None
+    seconds = 0
+    for part in text.split(":"):
+        if not part.isdigit():
+            return None
+        seconds = seconds * 60 + int(part)
+    return seconds or None
+
+
+def _normalize_ytm_item(
+    item: dict,
+    *,
+    fallback_artist: str | None = None,
+    fallback_album: str | None = None,
+) -> dict | None:
+    """One YouTube Music song object -> the candidate dict ranking expects.
+
+    Covers every shape the provider hands us: song/video search results,
+    watch-playlist tracks, an artist's top songs and an album's track list.
+    """
     if not isinstance(item, dict):
         return None
-    page = item.get("perma_url")
-    if not page:
+    video_id = item.get("videoId") or item.get("video_id")
+    if not video_id or not YT_ID_RE.match(str(video_id)):
         return None
-
-    more = item.get("more_info") or {}
-    artist_map = more.get("artistMap") or {}
-    primary = [
-        (a.get("name") or "").strip()
-        for a in (artist_map.get("primary_artists") or [])
-        if (a.get("name") or "").strip()
-    ]
-    artist_ids = [
-        str(a.get("id"))
-        for a in (artist_map.get("primary_artists") or [])
-        if a.get("id")
-    ]
-    if not artist_ids:
-        # v3 search objects expose the artist ids as a comma-separated string.
-        raw_ids = item.get("primary_artists_id")
-        if isinstance(raw_ids, str):
-            artist_ids = [part.strip() for part in raw_ids.split(",") if part.strip()]
-
-    artist = (item.get("primary_artists") or "").strip()
-    if not artist and primary:
-        artist = ", ".join(primary)
-    if not artist:
-        subtitle = item.get("subtitle") or ""
-        artist = subtitle.split(" - ", 1)[0].strip()
-    artist = artist.replace("&amp;", "&").strip() or None
-
-    featured = [
-        (a.get("name") or "").strip()
-        for a in (artist_map.get("featured_artists") or [])
-        if (a.get("name") or "").strip()
-    ]
-    if not featured:
-        raw_featured = item.get("featured_artists")
-        if isinstance(raw_featured, str):
-            featured = [part.strip() for part in raw_featured.split(",") if part.strip()]
-    featured = [name.replace("&amp;", "&") for name in featured]
-
-    album_artists = artist_map.get("album_artists") or []
-    if not isinstance(album_artists, list):
-        album_artists = []
-    album_artist = ", ".join(
-        (a.get("name") or "").strip()
-        for a in album_artists
-        if (a.get("name") or "").strip()
-    )
-    album_artist = (
-        album_artist
-        or more.get("album_artist")
-        or item.get("album_artist")
-        or None
-    )
-    if isinstance(album_artist, str):
-        album_artist = album_artist.replace("&amp;", "&").strip() or None
-    else:
-        album_artist = None
-
-    title = (item.get("song") or item.get("title") or "").strip()
+    title = (item.get("title") or "").strip()
     if not title:
         return None
-    title = title.replace("&amp;", "&")
 
-    album = (item.get("album") or more.get("album") or "").strip() or None
-    if album:
-        album = album.replace("&amp;", "&")
+    artists = [a for a in (item.get("artists") or []) if isinstance(a, dict)]
+    names = [(a.get("name") or "").strip() for a in artists]
+    artist_ids = [str(a.get("id")) for a in artists if a.get("id")]
+    artist = ", ".join(name for name in names if name) or (fallback_artist or None)
 
-    duration = item.get("duration") or more.get("duration")
-    try:
-        duration = int(duration) if duration not in (None, "") else None
-    except (TypeError, ValueError):
-        duration = None
+    album = item.get("album")
+    album_name = album_id = None
+    if isinstance(album, dict):
+        album_name = (album.get("name") or "").strip() or None
+        album_id = album.get("id") or None
+    elif isinstance(album, str) and album.strip():
+        album_name = album.strip()
+    album_name = album_name or (fallback_album or None)
 
-    song_id = item.get("id") or _jiosaavn_song_id(page)
-    album_id = more.get("album_id") or item.get("albumid") or item.get("album_id")
-
-    raw_play_count = item.get("play_count") or more.get("play_count")
-    try:
-        play_count = int(raw_play_count) if raw_play_count not in (None, "") else 0
-    except (TypeError, ValueError):
-        play_count = 0
+    thumbnails = [
+        t for t in (item.get("thumbnails") or [])
+        if isinstance(t, dict) and t.get("url")
+    ]
+    year = item.get("year")
 
     return {
-        "id": str(song_id) if song_id else None,
+        "id": str(video_id),
         "title": title,
         "artist": artist,
         "artist_ids": artist_ids,
-        "featured_artists": ", ".join(featured) or None,
-        "album_artist": album_artist,
-        "album": album,
+        "featured_artists": None,
+        "album_artist": None,
+        "album": album_name,
         "album_id": str(album_id) if album_id else None,
-        "duration": duration or None,
-        "language": (item.get("language") or more.get("language") or None),
-        "year": (item.get("year") or more.get("year") or None),
-        "play_count": play_count,
-        "webpage_url": page,
-        "thumbnail": _thumb(item.get("image") or more.get("image")),
+        "duration": _parse_duration(item.get("duration") or item.get("duration_seconds")),
+        "language": None,
+        "year": str(year) if year else None,
+        "play_count": _parse_count(item.get("views") or item.get("play_count")),
+        "webpage_url": _music_watch_url(str(video_id)),
+        "thumbnail": thumbnails[-1].get("url") if thumbnails else None,
     }
 
 
-def search_jiosaavn(query: str, limit: int | None = None) -> list[dict]:
-    """Normalized JioSaavn song results for a single query (cached)."""
+def _ytm_search_songs(query: str, limit: int) -> list[dict]:
+    """YouTube Music's own song results for a single query."""
+    yt = _ytm()
+    found = yt.search(query, filter="songs", limit=limit) or []
+    results = [c for c in (_normalize_ytm_item(i) for i in found) if c]
+    if results:
+        return results
+
+    # Some markets answer the unfiltered search when filter="songs" comes back
+    # empty; keep only song/video rows so albums and artists never enter a queue.
+    results = []
+    for item in yt.search(query, limit=max(limit, 5)) or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("resultType") not in (None, "song", "video"):
+            continue
+        candidate = _normalize_ytm_item(item)
+        if candidate:
+            results.append(candidate)
+    return results
+
+
+def _search_youtube_fallback(query: str, limit: int) -> list[dict]:
+    """Explicit yt-dlp `ytsearch` fallback, used when ytmusicapi fails.
+
+    Flat extraction: one request for the whole result page, no per-video
+    round-trips. Called out in the logs so a provider swap is never silent.
+    """
+    options = _with_ua({"extract_flat": "in_playlist", "noplaylist": False})
+    options["playlist_items"] = str(max(1, limit))
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(f"ytsearch{max(1, limit)}:{query}", download=False)
+
+    results: list[dict] = []
+    for entry in [e for e in (info or {}).get("entries") or [] if e]:
+        if not isinstance(entry, dict):
+            continue
+        video_id = entry.get("id") or _video_id_from_url(
+            entry.get("webpage_url") or entry.get("url")
+        )
+        if not video_id or not YT_ID_RE.match(str(video_id)):
+            continue
+        thumbnails = entry.get("thumbnails") or []
+        results.append(
+            {
+                "id": str(video_id),
+                "title": (entry.get("title") or query).strip(),
+                "artist": (
+                    (entry.get("uploader") or entry.get("channel") or "").strip()
+                    or None
+                ),
+                "artist_ids": [],
+                "featured_artists": None,
+                "album_artist": None,
+                "album": None,
+                "album_id": None,
+                "duration": int(entry.get("duration") or 0) or None,
+                "language": None,
+                "year": None,
+                "play_count": int(entry.get("view_count") or 0),
+                "webpage_url": _music_watch_url(str(video_id)),
+                "thumbnail": thumbnails[-1].get("url") if thumbnails else None,
+            }
+        )
+    return results
+
+
+def search_youtube_music(query: str, limit: int | None = None) -> list[dict]:
+    """YouTube Music matches for one plain query (cached).
+
+    Primary: ytmusicapi's song search. Fallback: yt-dlp `ytsearch`. When both
+    fail the real reason is raised, so a blocked IP is never reported as an
+    empty result set.
+    """
     if limit is None:
         limit = MAX_RESULTS
-    query = query.strip()
+    query = (query or "").strip()
     if not query:
         return []
 
@@ -615,26 +749,30 @@ def search_jiosaavn(query: str, limit: int | None = None) -> list[dict]:
     if cached is not None:
         return cached
 
-    data = _saavn_get(
-        "search.getResults",
-        {
-            "_page": "1",
-            "p": "1",
-            "n": str(limit),
-            "q": query,
-            "result": "song",
-            "specific": "true",
-        },
-    )
-
-    results: list[dict] = []
-    for item in (data.get("results") or [])[:limit]:
-        candidate = _normalize_song_item(item)
-        if candidate:
-            results.append(candidate)
+    try:
+        results = _ytm_search_songs(query, limit)
+    except Exception as exc:  # noqa: BLE001 - fall back, then report honestly
+        log.warning("ytmusicapi search failed for %r: %s", query, reason_line(exc))
+        try:
+            results = _search_youtube_fallback(query, limit)
+        except Exception as fallback_exc:
+            raise SearchProviderError(
+                f"YouTube Music search is unavailable: {reason_line(fallback_exc)}"
+            ) from fallback_exc
+        log.info(
+            "yt-dlp search fallback found %d result(s) for %r", len(results), query
+        )
 
     _TRACK_CACHE.set(key, results)
     return results
+
+
+# --- YouTube Music catalogue lookups (used by autoplay) --------------------
+#
+# Each one mirrors a relationship rail the old provider offered: the watch
+# playlist ("mixed for you"), the artist's top songs, the album's other
+# tracks, and related artists. Failures log the real reason and yield nothing,
+# exactly like the rest of the provider layer.
 
 
 # --- Query understanding -------------------------------------------------
@@ -675,7 +813,7 @@ _SUFFIX_NOISE = re.compile(
     re.I,
 )
 
-# Cover/karaoke/tribute markers. JioSaavn is full of "originally performed by",
+# Cover/karaoke/tribute markers. Streaming catalogues are full of "originally performed by",
 # "in the style of", "made famous by" and karaoke uploads whose *titles* name the
 # original artist; left alone they masquerade as exact title matches and hide the
 # fact that the performer is not the artist the user asked for.
@@ -914,7 +1052,7 @@ def _title_similarity(spec: dict, title: str) -> tuple[float, bool]:
 
 
 def _popularity(play_count: int | None) -> float:
-    """Map JioSaavn's play count to a 0..1 signal (100M+ plays saturates)."""
+    """Map a provider play/view count to a 0..1 signal (100M+ saturates)."""
     try:
         plays = int(play_count or 0)
     except (TypeError, ValueError):
@@ -1035,8 +1173,8 @@ def score_candidate(
     popularity = _popularity(candidate.get("play_count"))
     score += 0.07 * popularity
 
-    # Keep JioSaavn's own relevance ordering as a last-resort tie-breaker for
-    # candidates that carry no popularity data.
+    # Keep the provider's own relevance ordering as a last-resort tie-breaker
+    # for candidates that carry no popularity data.
     score += 0.02 * (0.85 ** max(0, position))
 
     signals = {
@@ -1079,14 +1217,20 @@ def rank_candidates(
 
 
 def _search_pool(query: str, spec: dict, limit: int = MAX_POOL) -> list[dict]:
-    """Pool normalized candidates from the full query and its relaxed fallbacks."""
+    """Pool normalized candidates from the full query and its relaxed fallbacks.
+
+    Provider failures are remembered: an empty pool caused by a blocked IP or a
+    dead API raises the real reason instead of looking like "no results".
+    """
     pool: list[dict] = []
     seen: set = set()
+    errors: list[Exception] = []
     for q in _search_queries(query, spec):
         try:
-            found = search_jiosaavn(q, limit=limit)
+            found = search_youtube_music(q, limit=limit)
         except Exception as exc:  # noqa: BLE001
-            log.warning("JioSaavn search failed for %r: %s", q, reason_line(exc))
+            log.warning("search failed for %r: %s", q, reason_line(exc))
+            errors.append(exc)
             continue
         for candidate in found:
             key = candidate.get("id") or candidate.get("webpage_url")
@@ -1098,46 +1242,9 @@ def _search_pool(query: str, spec: dict, limit: int = MAX_POOL) -> list[dict]:
             break
         if q == query and len(pool) >= SEARCH_EARLY_STOP:
             break
+    if not pool and errors:
+        raise errors[-1]
     return pool
-
-
-def _extract_title_from_url(url: str) -> str | None:
-    """Best-effort title extraction from a non-YouTube platform URL."""
-    try:
-        parsed = urlparse(url)
-        netloc = parsed.netloc.lower().split(":")[0].replace("www.", "")
-        path = urllib.parse.unquote(parsed.path or "")
-        if netloc in {"spotify.com", "open.spotify.com"}:
-            parts = [p for p in path.split("/") if p]
-            if len(parts) >= 2:
-                slug = parts[-1]
-                return slug.replace("-", " ").strip()
-        if path:
-            slug = path.rstrip("/").split("/")[-1]
-            if slug:
-                return slug.replace("-", " ").replace("_", " ").strip()
-    except Exception:
-        pass
-    return None
-
-
-def _jiosaavn_info_for_url(url: str) -> dict | None:
-    """JioSaavn fallback only for exact URL-derived song names, not generic keyword search."""
-    host = urlparse(url).netloc.lower().split(":")[0].replace("www.", "")
-    if "youtube" in host or host in {"youtu.be", "m.youtube.com", "music.youtube.com"}:
-        return None
-    title = _extract_title_from_url(url)
-    if not title:
-        return None
-    try:
-        matches = search_jiosaavn(title, limit=1)
-        if not matches:
-            return None
-        page = matches[0]["webpage_url"]
-        return _extract_once(YDL_OPTIONS, page)
-    except Exception as exc:
-        log.warning("jiosaavn url fallback failed for %r: %s", url, reason_line(exc))
-        return None
 
 
 def unsupported_reason(text: str) -> str | None:
@@ -1194,6 +1301,9 @@ class Track:
         album: str | None = None,
         language: str | None = None,
         requested_query: str | None = None,
+        artist_ids: list[str] | None = None,
+        album_id: str | None = None,
+        resolved_at: float | None = None,
     ):
         self.source = source
         self.title = title
@@ -1220,10 +1330,19 @@ class Track:
         self.start_offset = start_offset
         self.quality = quality
 
-        # JioSaavn identity, used to detect duplicates and to seed autoplay.
-        self.song_id = song_id or _jiosaavn_song_id(webpage_url)
+        # YouTube Music identity (the video id), used to detect duplicates and
+        # to seed autoplay; falls back to the legacy JioSaavn token for links
+        # saved before the provider changed.
+        self.song_id = song_id or _video_id_from_url(webpage_url) or _jiosaavn_song_id(webpage_url)
         self.album = album
         self.language = language
+
+        # Catalogue ids we already know, so autoplay never re-searches for them.
+        self.artist_ids = [str(a) for a in (artist_ids or []) if a]
+        self.album_id = album_id
+        # When the stream URL was minted, so a long queue can refresh an expired
+        # one instead of asking FFmpeg to fail first.
+        self.resolved_at = resolved_at
 
     def cleanup(self) -> None:
         """Delete the temporary file backing this track, if there is one."""
@@ -1325,6 +1444,12 @@ else:
 log.info("ffmpeg: %s", find_ffmpeg() or "MISSING")
 
 
+# Queued googlevideo URLs are minted at queue time and are good for a few
+# hours; refresh anything older before handing it to FFmpeg (see
+# MusicPlayer._refresh_stale_stream).
+STREAM_REFRESH_AFTER = 3 * 3600
+
+
 
 
 
@@ -1395,20 +1520,14 @@ def _merge_options(extra: dict) -> dict:
 
 
 def _extract_once(options: dict, query: str) -> dict | None:
-    """Extract one direct JioSaavn URL; text search is handled by the Saavn API."""
+    """Extract one direct URL; text search is handled by the provider API."""
     if not is_url(query):
-        raise ValueError("Only direct JioSaavn links can be extracted")
-    host = urlparse(query).netloc.lower().split(":")[0].removeprefix("www.")
-    if host != "jiosaavn.com" and not host.endswith(".jiosaavn.com"):
-        raise ValueError("Only JioSaavn links can be extracted")
+        raise ValueError("Only direct links can be extracted")
 
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(query, download=False)
         if not info:
-            raise LookupError("couldn't read that JioSaavn link")
-
-        if not info:
-            raise LookupError("no results")
+            raise LookupError("couldn't read that link")
 
         if info.get("_type") == "playlist":
             entries = [e for e in info.get("entries", []) if e]
@@ -1495,9 +1614,9 @@ def _build_track(
 ) -> Track:
     """Turn an extraction result into a playable Track.
 
-    Metadata from the winning JioSaavn candidate (artist/album/language/artwork)
-    fills in whatever yt-dlp didn't report, so the queue and autoplay have a
-    consistent identity for every track.
+    Metadata from the winning candidate (artist/album/artwork/catalogue ids)
+    fills in whatever yt-dlp didn't report, so the queue, the likes list and
+    autoplay have a consistent identity for every track.
     """
     candidate = candidate or {}
     url = info.get("url")
@@ -1505,7 +1624,7 @@ def _build_track(
 
         formats = [f for f in info.get("formats", []) if f.get("url")]
         if not formats:
-            raise LookupError("no playable stream for that track")
+            raise StreamResolveError("no playable audio stream for that track")
         url = formats[-1]["url"]
 
     artist = info.get("artist") or info.get("creator") or info.get("uploader")
@@ -1522,11 +1641,9 @@ def _build_track(
 
     bitrate = info.get("abr") or info.get("tbr")
     quality = f"{round(bitrate)}k" if bitrate else (info.get("format_note") or None)
-    webpage = info.get("webpage_url") or candidate.get("webpage_url") or ""
-    if "jiosaavn" in webpage.lower() or "jiosaavn" in str(info.get("extractor", "")).lower():
-        quality = quality or "320k"
-        if quality and quality.startswith("0"):
-            quality = "320k"
+    # Prefer the candidate's own link: for YouTube Music that keeps the
+    # music.youtube.com URL the user picked (and the label on the card).
+    webpage = candidate.get("webpage_url") or info.get("webpage_url") or ""
 
     return Track(
         source=url,
@@ -1538,9 +1655,12 @@ def _build_track(
         artist=artist,
         thumbnail=thumbnail,
         quality=quality,
-        song_id=candidate.get("id") or _jiosaavn_song_id(webpage),
+        song_id=candidate.get("id") or _video_id_from_url(webpage) or _jiosaavn_song_id(webpage),
         album=info.get("album") or candidate.get("album"),
         language=info.get("language") or candidate.get("language"),
+        artist_ids=candidate.get("artist_ids") or None,
+        album_id=candidate.get("album_id") or None,
+        resolved_at=time.monotonic(),
     )
 
 def _cut_track(track: Track, seconds: int) -> Track | None:
@@ -1594,6 +1714,9 @@ def _cut_track(track: Track, seconds: int) -> Track | None:
         album=track.album,
         language=track.language,
         requested_query=track.requested_query,
+        artist_ids=track.artist_ids,
+        album_id=track.album_id,
+        resolved_at=track.resolved_at,
     )
 
 
@@ -1603,17 +1726,47 @@ def _is_bot_check(exc: Exception) -> bool:
     return "sign in to confirm" in message or "not a bot" in message
 
 
-async def _youtube_info(query: str) -> tuple[dict | None, Exception | None]:
-    """First usable YouTube result for a pasted link across client fallbacks."""
+def _youtube_error_message(exc: Exception | None) -> str:
+    """A truthful, chat-friendly reason for a YouTube extraction failure.
+
+    The distinction matters: an IP block is not the same as a missing song, and
+    saying "couldn't find it" about a sign-in challenge would be a lie.
+    """
+    if exc is None:
+        return "YouTube returned nothing for that link."
+    reason = reason_line(exc)
+    text = str(exc).lower()
+    if _is_bot_check(exc):
+        return (
+            "YouTube is asking this server to prove it isn't a bot, so I can't "
+            "stream right now. Datacenter IPs hit this often - try again later."
+        )
+    if "video unavailable" in text or "private video" in text or "removed" in text:
+        return f"That video is unavailable: {reason}"
+    if "403" in reason or "forbidden" in text:
+        return f"YouTube refused the audio request (403): {reason}"
+    if "timed out" in text or "timeout" in text:
+        return f"YouTube timed out: {reason}"
+    return reason
+
+
+async def _youtube_extract(url: str) -> dict:
+    """One YouTube URL's metadata, trying the documented player-client fallbacks.
+
+    Raises StreamResolveError with the classified reason, so callers never have
+    to guess whether this was a missing video or an IP-level block.
+    """
     last_error: Exception | None = None
     for attempt, extra in enumerate(YOUTUBE_CLIENT_ATTEMPTS):
         if attempt:
             log.info("youtube retry %d with client set %s", attempt, extra["extractor_args"])
         started = time.monotonic()
         try:
-            info = await asyncio.to_thread(_extract_once, _merge_options(extra), query)
-            return info, None
-        except DownloadError as exc:
+            info = await asyncio.to_thread(_extract_once, _merge_options(extra), url)
+            if not info:
+                raise LookupError("YouTube returned no metadata for that link")
+            return info
+        except (DownloadError, LookupError, ValueError) as exc:
             last_error = exc
             log.warning(
                 "youtube client attempt %d failed after %.1fs: %s",
@@ -1624,7 +1777,7 @@ async def _youtube_info(query: str) -> tuple[dict | None, Exception | None]:
             if _is_bot_check(exc):
                 log.warning("youtube is blocking this IP - skipping remaining clients")
                 break
-    return None, last_error
+    raise StreamResolveError(_youtube_error_message(last_error)) from last_error
 
 
 async def _invidious_info(query: str) -> tuple[dict | None, Exception | None]:
@@ -1709,10 +1862,18 @@ class AmbiguousMatch(LookupError):
 
 
 class StreamResolveError(LookupError):
-    """A plausible JioSaavn track was found but its audio stream failed to resolve.
+    """A plausible track was found but its audio stream failed to resolve.
 
     Distinct from a search failure so the reply can say the track exists but
     wouldn't play, rather than claiming nothing was found.
+    """
+
+
+class SearchProviderError(LookupError):
+    """YouTube Music search itself is unavailable (blocked IP, dead API).
+
+    Raised instead of returning an empty list, so a datacenter-level failure is
+    never reported to the user as "no results for your song".
     """
 
 
@@ -1767,13 +1928,20 @@ def _same_recording_candidate(candidate: dict, best: dict, spec: dict) -> bool:
 
 
 def _resolved_info_matches_candidate(info: dict, candidate: dict) -> bool:
-    """Ensure yt-dlp resolved the selected JioSaavn result, not another item."""
-    candidate_url = candidate.get("webpage_url") or ""
-    resolved_url = info.get("webpage_url") or info.get("original_url") or ""
-    candidate_token = _jiosaavn_song_id(candidate_url)
-    resolved_token = _jiosaavn_song_id(resolved_url)
-    if candidate_token and resolved_token and candidate_token != resolved_token:
-        return False
+    """Ensure yt-dlp resolved the selected result, not some other video.
+
+    A matching provider id (YouTube video id / JioSaavn token) is authoritative:
+    it proves the extraction is the candidate the ranking validated. Only when
+    neither side carries an id do we fall back to title and artist similarity.
+    """
+    candidate_token = _video_id_from_url(candidate.get("webpage_url")) or _jiosaavn_song_id(
+        candidate.get("webpage_url")
+    )
+    resolved_token = _video_id_from_url(
+        info.get("webpage_url") or info.get("original_url")
+    ) or _jiosaavn_song_id(info.get("webpage_url") or info.get("original_url"))
+    if candidate_token and resolved_token:
+        return candidate_token == resolved_token
 
     expected_title = _norm_text(_title_core(candidate.get("title") or ""))
     resolved_title = _norm_text(_title_core(info.get("title") or ""))
@@ -1788,34 +1956,41 @@ def _resolved_info_matches_candidate(info: dict, candidate: dict) -> bool:
         return False
 
     expected_artist = _content_tokens(candidate.get("artist") or "")
-    resolved_artist = _content_tokens(info.get("artist") or info.get("creator") or "")
+    resolved_artist = _content_tokens(
+        info.get("artist") or info.get("creator") or info.get("uploader") or ""
+    )
     if expected_artist and resolved_artist and not (expected_artist & resolved_artist):
         return False
     return True
 
 
-async def _resolve_jiosaavn_candidate(
+async def _resolve_youtube_candidate(
     candidate: dict, requested_by: str, requested_query: str
 ) -> Track:
     """Resolve one ranked candidate while preserving its validated identity."""
+    video_id = candidate.get("id") or _video_id_from_url(candidate.get("webpage_url"))
     url = candidate.get("webpage_url")
     if not url:
-        raise LookupError("JioSaavn candidate has no song URL")
-    info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, url)
+        raise LookupError("search result has no song URL")
+    info = await _youtube_extract(url)
     if not info:
-        raise LookupError("JioSaavn returned no playable track for that result")
+        raise LookupError("YouTube returned no playable track for that result")
     if not _resolved_info_matches_candidate(info, candidate):
-        raise LookupError("JioSaavn resolved a different song than the selected result")
+        raise LookupError("YouTube resolved a different song than the selected result")
     track = _build_track(info, requested_query, requested_by, candidate=candidate)
-    candidate_id = candidate.get("id")
-    if candidate_id and track.song_id != str(candidate_id):
-        raise LookupError("JioSaavn track identity changed during stream resolution")
+    if video_id and track.song_id != str(video_id):
+        raise LookupError("track identity changed during stream resolution")
     track.requested_query = requested_query
     return track
 
 
 async def resolve_track(query: str, requested_by: str) -> Track:
-    """Resolve local files or JioSaavn tracks; never stream from other platforms."""
+    """Resolve local files or YouTube Music tracks; never stream from other platforms.
+
+    A pasted YouTube / YouTube Music link is played as-is (video id known, no
+    re-search). A JioSaavn link is still accepted because likes saved before the
+    provider change point at JioSaavn URLs. Everything else is a text search.
+    """
     query = query.strip()
     if not query:
         raise ValueError("empty query")
@@ -1831,22 +2006,37 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         return track
 
     if is_url(query):
-        host = urlparse(query).netloc.lower().split(":")[0].replace("www.", "")
-        if host != "jiosaavn.com" and not host.endswith(".jiosaavn.com"):
+        video_id = _video_id_from_url(query)
+        if video_id:
+            info = await _youtube_extract(_music_watch_url(video_id))
+            track = _build_track(info, query, requested_by)
+            track.requested_query = query
+            return track
+
+        if _jiosaavn_song_id(query):
+            # Legacy: /likes rows saved before the migration still hold these.
+            try:
+                info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, query)
+            except Exception as exc:
+                raise StreamResolveError(
+                    "That JioSaavn link no longer plays - search the song by name "
+                    f"instead. ({reason_line(exc)})"
+                ) from exc
+            if not info:
+                raise StreamResolveError("That JioSaavn link returned no playable track.")
+            track = _build_track(info, query, requested_by)
+            track.requested_query = query
+            return track
+
+        if is_youtube_url(query) or "playlist?list=" in query:
             raise ValueError(
-                "Audira plays from JioSaavn only. Search by song name or paste a JioSaavn link."
+                "Play a single YouTube song, not a whole playlist - "
+                "paste the song's own link or search by name."
             )
-        try:
-            info = await asyncio.to_thread(_extract_once, YDL_OPTIONS, query)
-        except Exception as exc:
-            raise StreamResolveError(
-                f"I reached JioSaavn but couldn't load that link: {reason_line(exc)}"
-            ) from exc
-        if not info:
-            raise StreamResolveError("JioSaavn returned no playable track for that link.")
-        track = _build_track(info, query, requested_by)
-        track.requested_query = query
-        return track
+        raise ValueError(
+            "Audira plays from YouTube Music. Search by song name or paste a "
+            "YouTube link."
+        )
 
     last_error: Exception | None = None
     try:
@@ -1855,7 +2045,9 @@ async def resolve_track(query: str, requested_by: str) -> Track:
             timeout=45,
         )
     except asyncio.TimeoutError as exc:
-        raise LookupError("JioSaavn search timed out after 45 seconds") from exc
+        raise LookupError("YouTube Music search timed out after 45 seconds") from exc
+    except SearchProviderError:
+        raise
     except Exception as exc:
         raise LookupError(reason_line(exc)) from exc
 
@@ -1870,7 +2062,7 @@ async def resolve_track(query: str, requested_by: str) -> Track:
     ]
     if not candidates:
         raise LookupError(
-            f"I couldn't find a standard recording of **{query}** on JioSaavn. "
+            f"I couldn't find a standard recording of **{query}** on YouTube Music. "
             "Try specifying the version you want."
         )
 
@@ -1898,13 +2090,13 @@ async def resolve_track(query: str, requested_by: str) -> Track:
             )
             raise AmbiguousMatch(query, alternatives)
         raise LookupError(
-            f"I couldn't find **{query}** by that artist on JioSaavn. "
+            f"I couldn't find **{query}** by that artist on YouTube Music. "
             "Check the spelling or try a different search."
         )
 
     if best_score < CONFIDENCE_MEDIUM:
         raise LookupError(
-            f"I wasn't confident enough that any JioSaavn result is **{query}**. "
+            f"I wasn't confident enough that any YouTube Music result is **{query}**. "
             "Try adding the artist name or a more specific title."
         )
 
@@ -1970,29 +2162,29 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         if candidate is not best and not _same_recording_candidate(candidate, best, spec):
             continue
         try:
-            return await _resolve_jiosaavn_candidate(candidate, requested_by, query)
+            return await _resolve_youtube_candidate(candidate, requested_by, query)
         except Exception as exc:
             last_error = exc
             log.warning(
-                "JioSaavn candidate resolve failed for %r: %s",
+                "candidate resolve failed for %r: %s",
                 candidate.get("webpage_url"),
                 reason_line(exc),
             )
 
-    # A track existed on JioSaavn but we couldn't get audio for it - that is a
-    # stream failure, not a search failure.
+    # A track existed but we couldn't get audio for it - that is a stream
+    # failure (IP block, dead format, expired link), not a search failure.
     if last_error is not None:
         raise StreamResolveError(
-            f"I found **{best.get('title') or query}** on JioSaavn but couldn't "
+            f"I found **{best.get('title') or query}** but couldn't "
             f"load its audio: {reason_line(last_error)}"
         ) from last_error
     raise StreamResolveError(
-        f"I found results for **{query}** on JioSaavn but none of them were playable."
+        f"I found results for **{query}** but none of them were playable."
     )
 
 
 def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
-    """Search JioSaavn (with query relaxation) and return candidates ranked by
+    """Search YouTube Music (with query relaxation) and return candidates ranked by
     how well they match the requested title, artist, version and duration."""
     query = query.strip()
     if not query:
@@ -2004,7 +2196,7 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     except LookupError:
         raise
     except Exception as exc:
-        log.warning("JioSaavn search failed for %r: %s", query, reason_line(exc))
+        log.warning("search failed for %r: %s", query, reason_line(exc))
         raise LookupError(reason_line(exc)) from exc
 
     if not pool:
@@ -2012,7 +2204,7 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
     ranked = rank_candidates(pool, spec, manual_search=True)
     log.info(
-        "JioSaavn search %r: provider=jiosaavn, %d candidate(s), best=%.2f %r by %r",
+        "search %r: provider=ytmusic, %d candidate(s), best=%.2f %r by %r",
         query,
         len(pool),
         ranked[0][0],
@@ -2040,104 +2232,87 @@ def search_candidates(query: str, limit: int = MAX_RESULTS) -> list[dict]:
     return results
 
 
-# --- JioSaavn recommendations (used by autoplay) -------------------------
+# --- YouTube Music recommendations (used by autoplay) ---------------------
 #
-# JioSaavn's own "You Might Like" (reco.getreco) is not reliably populated via
-# api.php, so we lean on the metadata that *is* dependable: a track's primary
-# artists, its album, and the artist page's `similarArtists` (genre/style kin).
-# Everything here ultimately yields normal song candidates that resolve through
-# the same yt-dlp JioSaavn extractor as ordinary search.
+# Every rail here is a real relationship in the catalogue - the song's watch
+# playlist ("mixed for you"), the artist's top songs, the rest of its album,
+# and related artists - never a keyword guess. Each lookup is bounded, cached
+# and allowed to fail quietly, so a degraded provider can't stall the player.
 
 
-def _saavn_song_detail(song_token: str) -> dict | None:
-    """Rich metadata for one song (artist ids, album, language...).
-
-    `token` must be the perma-url token (the last path segment of the song URL);
-    the short song id is *not* accepted by webapi.get and comes back as an empty
-    list, so a non-dict response is treated as "not found".
-    """
-    if not song_token:
-        return None
-    key = ("song", song_token)
-    cached = _DETAIL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    try:
-        data = _saavn_get(
-            "webapi.get",
-            {"type": "song", "token": song_token, "n": "1", "p": "1"},
-            v4=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.info("jiosaavn song detail failed for %s: %s", song_token, reason_line(exc))
-        return None
-    songs = data.get("songs") if isinstance(data, dict) else None
-    detail = _normalize_song_item(songs[0]) if songs else None
-    if detail:
-        _DETAIL_CACHE.set(key, detail)
-    return detail
-
-
-def _saavn_artist_page(artist_id: str) -> dict | None:
-    if not artist_id:
-        return None
-    key = ("artist", str(artist_id))
-    cached = _DETAIL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    try:
-        data = _saavn_get(
-            "artist.getArtistPageDetails", {"artistId": str(artist_id)}, v4=True
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.info("jiosaavn artist page failed for %s: %s", artist_id, reason_line(exc))
-        return None
-    if isinstance(data, dict):
-        _DETAIL_CACHE.set(key, data)
-        return data
-    return None
-
-
-def _saavn_similar_artists(artist_id: str) -> list[dict]:
-    page = _saavn_artist_page(artist_id) or {}
-    similar = page.get("similarArtists") or []
-    return [a for a in similar if isinstance(a, dict) and a.get("id")]
-
-
-def _saavn_artist_other_top_songs(
-    artist_ids: list[str], song_id: str | None, language: str | None, limit: int = 12
-) -> list[dict]:
-    """Other popular tracks by the same artist(s) - JioSaavn's own related-songs rail."""
-    if not artist_ids:
+def _ytm_watch_playlist(video_id: str, limit: int = 50) -> list[dict]:
+    """YouTube Music's 'mixed for you' rail for one song (its watch playlist)."""
+    if not video_id:
         return []
-    params = {
-        "artist_ids": ",".join(str(a) for a in artist_ids if a),
-        "song_id": song_id or "",
-        "n": str(limit),
-        "p": "1",
-    }
-    if language:
-        params["language"] = language
-    key = ("artist_other", params["artist_ids"], song_id, language, limit)
+    key = ("watch", str(video_id))
     cached = _DETAIL_CACHE.get(key)
     if cached is not None:
         return cached
     try:
-        data = _saavn_get("search.artistOtherTopSongs", params, v4=True)
+        data = _ytm().get_watch_playlist(video_id, limit=limit)
     except Exception as exc:  # noqa: BLE001
-        log.info("jiosaavn same-artist songs failed: %s", reason_line(exc))
+        log.info("watch playlist failed for %s: %s", video_id, reason_line(exc))
         return []
-    results = []
-    for item in data if isinstance(data, list) else []:
-        candidate = _normalize_song_item(item)
-        if candidate:
-            results.append(candidate)
+    tracks = (data or {}).get("tracks") or []
+    results = [
+        candidate
+        for candidate in (_normalize_ytm_item(t) for t in tracks)
+        if candidate
+    ]
     _DETAIL_CACHE.set(key, results)
     return results
 
 
-def _saavn_album_tracks(album_id: str, limit: int = 30) -> list[dict]:
-    """Other tracks on the same album."""
+def _ytm_artist_songs(artist_id: str, limit: int = 20) -> list[dict]:
+    """The artist's top songs on YouTube Music."""
+    if not artist_id:
+        return []
+    key = ("artist_songs", str(artist_id), limit)
+    cached = _DETAIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        data = _ytm().get_artist(artist_id)
+    except Exception as exc:  # noqa: BLE001
+        log.info("artist lookup failed for %s: %s", artist_id, reason_line(exc))
+        return []
+    songs = ((data or {}).get("songs") or {}).get("results") or []
+    results = [
+        candidate
+        for candidate in (
+            _normalize_ytm_item(song) for song in songs[:limit] if isinstance(song, dict)
+        )
+        if candidate
+    ]
+    _DETAIL_CACHE.set(key, results)
+    return results
+
+
+def _ytm_related_artist_ids(artist_id: str, limit: int = 5) -> list[str]:
+    """Related-artist browse ids from the artist page ("fans might also like")."""
+    if not artist_id:
+        return []
+    key = ("related_artists", str(artist_id))
+    cached = _DETAIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        data = _ytm().get_artist(artist_id)
+    except Exception as exc:  # noqa: BLE001
+        log.info("related artists failed for %s: %s", artist_id, reason_line(exc))
+        return []
+    related = ((data or {}).get("related") or {}).get("results") or []
+    ids = [
+        str(item["browseId"])
+        for item in related[:limit]
+        if isinstance(item, dict) and item.get("browseId")
+    ]
+    _DETAIL_CACHE.set(key, ids)
+    return ids
+
+
+def _ytm_album_tracks(album_id: str, limit: int = 30) -> list[dict]:
+    """The other tracks on the same album."""
     if not album_id:
         return []
     key = ("album", str(album_id))
@@ -2145,47 +2320,36 @@ def _saavn_album_tracks(album_id: str, limit: int = 30) -> list[dict]:
     if cached is not None:
         return cached
     try:
-        data = _saavn_get("content.getAlbumDetails", {"albumid": str(album_id)}, v4=True)
+        data = _ytm().get_album(album_id)
     except Exception as exc:  # noqa: BLE001
-        log.info("jiosaavn album tracks failed for %s: %s", album_id, reason_line(exc))
+        log.info("album lookup failed for %s: %s", album_id, reason_line(exc))
         return []
-    songs = data.get("list") or data.get("songs") or [] if isinstance(data, dict) else []
-    results: list[dict] = []
-    for item in songs[:limit]:
-        candidate = _normalize_song_item(item)
-        if candidate:
-            results.append(candidate)
-    _DETAIL_CACHE.set(key, results)
-    return results
-
-
-def _saavn_reco(song_id: str | None, language: str | None, limit: int = 12) -> list[dict]:
-    """JioSaavn's 'You Might Like' rail, when it has anything for this song."""
-    if not song_id:
-        return []
-    params = {"pid": song_id, "n": str(limit), "p": "1"}
-    if language:
-        params["language"] = language
-    key = ("reco", song_id, language, limit)
-    cached = _DETAIL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    try:
-        data = _saavn_get("reco.getreco", params, v4=True)
-    except Exception as exc:  # noqa: BLE001
-        log.info("jiosaavn reco failed for %s: %s", song_id, reason_line(exc))
-        return []
-    results = []
-    for item in data if isinstance(data, list) else []:
-        candidate = _normalize_song_item(item)
-        if candidate:
-            results.append(candidate)
+    album = data if isinstance(data, dict) else {}
+    album_name = (album.get("name") or "").strip() or None
+    artists = ", ".join(
+        (a.get("name") or "").strip()
+        for a in (album.get("artists") or [])
+        if isinstance(a, dict) and (a.get("name") or "").strip()
+    ) or None
+    tracks = album.get("tracks") or []
+    results = [
+        candidate
+        for candidate in (
+            _normalize_ytm_item(
+                track, fallback_artist=artists, fallback_album=album_name
+            )
+            for track in tracks[:limit]
+            if isinstance(track, dict)
+        )
+        if candidate
+    ]
     _DETAIL_CACHE.set(key, results)
     return results
 
 
 # Weight for the last-resort autoplay source. Lower than any relationship rail
-# (reco/same-artist/album/similar-artist) so it only wins when those are empty.
+# (watch playlist / same-artist / album / related-artist) so it only wins when
+# those are empty.
 BROAD_SEARCH_WEIGHT = 0.55
 
 
@@ -2194,36 +2358,45 @@ def _same_artist(a: str | None, b: str | None) -> bool:
     return bool(_content_tokens(a or "") & _content_tokens(b or ""))
 
 
-def _saavn_broad_search(finished: Track, detail: dict | None, limit: int = SEARCH_EARLY_STOP) -> list[dict]:
+def _music_broad_search(
+    finished: Track, detail: dict | None, limit: int = SEARCH_EARLY_STOP
+) -> list[dict]:
     """Last-resort autoplay: more songs by the same artist.
 
-    Used only when JioSaavn's relationship rails (reco / same-artist / album /
-    similar-artist) return nothing. Results are filtered to the same artist, so a
+    Used only when the relationship rails (watch playlist / same-artist / album /
+    related-artist) return nothing. Results are filtered to the same artist, so a
     degraded lookup can never drift into a random or unrelated track.
     """
     artist = (finished.artist or (detail or {}).get("artist") or "").strip()
     if not artist:
         return []
     try:
-        found = search_jiosaavn(artist, limit=limit)
+        found = search_youtube_music(artist, limit=limit)
     except Exception as exc:  # noqa: BLE001
         log.info("autoplay broad search failed for %r: %s", artist, reason_line(exc))
         return []
-    return [candidate for candidate in found if _same_artist(candidate.get("artist"), artist)]
+    return [
+        candidate for candidate in found if _same_artist(candidate.get("artist"), artist)
+    ]
 
 
-def _resolve_song_detail(finished: Track) -> dict | None:
-    """Identify the finished track on JioSaavn, using its link or a title search.
+def _resolve_music_detail(finished: Track) -> dict | None:
+    """Identify the finished track's catalogue ids, for the relationship rails.
 
-    `webapi.get` needs the perma-url token, so the link-derived token is tried
-    before the stored (short) song id.
+    Tracks queued from a search already carry their artist/album ids, so this
+    usually costs nothing. A local file or a pasted link falls back to a ranked
+    title search, which is the same lookup ordinary playback uses.
     """
-    for token in (_jiosaavn_song_id(finished.webpage_url), finished.song_id):
-        if not token:
-            continue
-        detail = _saavn_song_detail(token)
-        if detail:
-            return detail
+    artist_ids = [str(a) for a in (finished.artist_ids or []) if a]
+    album_id = finished.album_id
+    video_id = finished.song_id or _video_id_from_url(finished.webpage_url)
+    if artist_ids or album_id or video_id:
+        return {
+            "id": video_id,
+            "artist_ids": artist_ids,
+            "album_id": album_id,
+        }
+
     # Local file or a link we couldn't read: fall back to a ranked title search.
     query = f"{finished.title} {finished.artist}".strip() if finished.artist else finished.title
     try:
@@ -2243,7 +2416,7 @@ def _resolve_song_detail(finished: Track) -> dict | None:
 
 
 def _track_identity(track: Track) -> str:
-    """A stable key for dedup: prefer the JioSaavn id, else the normalized title."""
+    """A stable key for dedup: prefer the provider id, else the normalized title."""
     if track.song_id:
         return f"id:{track.song_id}"
     return "t:" + _autoplay_key(track.title)
@@ -2549,6 +2722,7 @@ class MusicPlayer:
                     break
 
                 track = self.queue.pop(0)
+                track = await self._refresh_stale_stream(track)
                 ok = await self._play_one(track)
 
 
@@ -2599,6 +2773,36 @@ class MusicPlayer:
             if self.voice.is_connected() and not self.queue:
                 log.info("queue finished - staying in the voice channel")
 
+    async def _refresh_stale_stream(self, track: Track) -> Track:
+        """Re-resolve a queued stream whose URL is probably expired.
+
+        Direct googlevideo links are good for a few hours, so a long queue can
+        easily outlive one. Refreshing before FFmpeg sees it keeps an expired
+        URL a cheap, clearly logged event instead of a mysterious playback
+        failure. The original is kept when the refresh itself fails.
+        """
+        if (
+            not track.is_stream
+            or track.temp_path
+            or track.resolved_at is None
+            or time.monotonic() - track.resolved_at < STREAM_REFRESH_AFTER
+        ):
+            return track
+        try:
+            fresh = await asyncio.wait_for(
+                resolve_track(track.webpage_url or track.title, track.requested_by),
+                timeout=60,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep what we already have
+            log.info(
+                "keeping the original stream for %s: %s", track.title, reason_line(exc)
+            )
+            return track
+        fresh.requested_query = track.requested_query or fresh.requested_query
+        track.cleanup()
+        log.info("refreshed the stream URL for %s", track.title)
+        return fresh
+
     async def _play_one(self, track: Track) -> bool:
         """Start one track and wait for it to finish."""
         self.current = track
@@ -2626,10 +2830,12 @@ class MusicPlayer:
                 before_options=before_options,
             )
         except Exception:
+            # Report failure, not success: the loop re-resolves the stream URL
+            # once for a stream (expired links) and simply moves on for a file.
             log.exception("ffmpeg failed for %s", track.title)
             self._notify(f"Couldn't play **{track.title}** - FFmpeg rejected that source.")
             self.current = None
-            return True
+            return False
 
         errors: list[Exception | None] = []
         try:
@@ -2689,22 +2895,25 @@ class MusicPlayer:
             self._skip_once = False
 
     def _autoplay_candidates(self, finished: Track) -> list[tuple[float, dict]]:
-        """Gather JioSaavn tracks related to `finished`, weighted by relationship.
+        """Gather YouTube Music tracks related to `finished`, weighted by relationship.
 
         Nothing here looks at title keywords. Recommendations come from the
-        track's own artist(s), its album and JioSaavn's similar-artist graph, so
-        a song is never suggested just because it shares a word with the title.
+        track's own watch playlist, its artist(s), its album and YouTube Music's
+        related-artist graph, so a song is never suggested just because it
+        shares a word with the title.
         """
-        detail = _resolve_song_detail(finished)
-        song_id = None
-        language = finished.language
-        artist_ids: list[str] = []
-        album_id = None
-        if detail:
-            song_id = detail.get("id") or _jiosaavn_song_id(detail.get("webpage_url"))
-            language = detail.get("language") or language
+        detail = _resolve_music_detail(finished)
+        video_id = finished.song_id or _video_id_from_url(finished.webpage_url)
+        if not video_id and detail:
+            video_id = detail.get("id")
+
+        artist_ids = [str(a) for a in (finished.artist_ids or []) if a]
+        album_id = finished.album_id
+        if not artist_ids and detail:
             artist_ids = [str(a) for a in (detail.get("artist_ids") or []) if a]
+        if not album_id and detail:
             album_id = detail.get("album_id")
+        language = finished.language
 
         weighted: list[tuple[float, dict]] = []
 
@@ -2712,39 +2921,24 @@ class MusicPlayer:
             for item in items:
                 weighted.append((weight, item))
 
-        # 1. JioSaavn's own "You Might Like" rail (when populated).
-        if song_id:
-            add(1.00, _saavn_reco(song_id, language))
+        # 1. YouTube Music's own "mixed for you" rail for this exact song.
+        if video_id:
+            add(1.00, _ytm_watch_playlist(video_id))
         # 2. More from the same primary artist(s): closest style match.
-        if artist_ids:
-            add(0.95, _saavn_artist_other_top_songs(artist_ids, song_id, language))
+        for artist_id in artist_ids[:3]:
+            add(0.95, _ytm_artist_songs(artist_id))
         # 3. Other tracks from the same album.
         if album_id:
-            add(0.90, _saavn_album_tracks(album_id))
-        # 4. Similar artists (JioSaavn's genre/style graph), then their songs.
-        similar = _saavn_similar_artists(artist_ids[0]) if artist_ids else []
-        for artist in similar[:5]:
-            related = _saavn_artist_other_top_songs(
-                [str(artist["id"])],
-                song_id,
-                artist.get("language") or language,
-                limit=8,
-            )
-            if not related:
-                page = _saavn_artist_page(str(artist["id"])) or {}
-                related = [
-                    c
-                    for c in (
-                        _normalize_song_item(s) for s in (page.get("topSongs") or [])
-                    )
-                    if c
-                ]
-            add(0.70, related)
+            add(0.90, _ytm_album_tracks(album_id))
+        # 4. Related artists ("fans might also like"), then their top songs.
+        if artist_ids:
+            for related_id in _ytm_related_artist_ids(artist_ids[0])[:5]:
+                add(0.70, _ytm_artist_songs(related_id, limit=8))
 
         # 5. Last resort: no relationship rails produced anything, so search the
         # artist's catalogue directly. Filtered to the same artist above.
         if not weighted:
-            broad = _saavn_broad_search(finished, detail)
+            broad = _music_broad_search(finished, detail)
             if broad:
                 log.info(
                     "autoplay: relationship rails empty for %r, broad artist search gave %d track(s)",
@@ -2754,10 +2948,11 @@ class MusicPlayer:
             add(BROAD_SEARCH_WEIGHT, broad)
 
         log.info(
-            "autoplay: %d weighted candidate(s) for %r (detail=%s)",
+            "autoplay: %d weighted candidate(s) for %r (detail=%s, language=%s)",
             len(weighted),
             finished.title,
             "yes" if detail else "no",
+            language or "none",
         )
         return weighted
 
@@ -2817,7 +3012,7 @@ class MusicPlayer:
         return None, last_error
 
     async def _queue_autoplay(self, finished: Track) -> None:
-        """Keep the music going with a genuinely related JioSaavn track."""
+        """Keep the music going with a genuinely related YouTube Music track."""
         if not self.autoplay or not self.voice.is_connected():
             return
         if self._autoplay_busy:
@@ -3732,10 +3927,10 @@ class SearchPicker(discord.ui.View):
 
         try:
             track = await asyncio.wait_for(
-                _resolve_jiosaavn_candidate(
+                _resolve_youtube_candidate(
                     chosen,
                     interaction.user.display_name,
-                    chosen.get("title") or "JioSaavn search result",
+                    chosen.get("title") or "YouTube Music search result",
                 ),
                 timeout=100,
             )
@@ -3860,7 +4055,7 @@ class Music(commands.Cog):
 
     @discord.app_commands.command(name="play", description="Play a song by name, link, or from music/.")
     @discord.app_commands.describe(
-        song="Song name, JioSaavn link, or a file in music/"
+        song="Song name, YouTube link, or a file in music/"
     )
     async def play(self, interaction: discord.Interaction, song: str):
 
@@ -3891,6 +4086,14 @@ class Music(commands.Cog):
                 f"I found a few possible matches for **{song}** - pick the one you meant:",
                 view=picker,
                 wait=True,
+            )
+            return
+        except SearchProviderError as exc:
+            # The provider itself is unreachable - not "no results for your song".
+            log.warning("search provider failed for %r: %s", song, exc)
+            await interaction.followup.send(
+                f"I couldn't search YouTube Music for **{song}**.\n"
+                f"Reason: `{reason_line(exc)}`"
             )
             return
         except StreamResolveError as exc:
@@ -4213,6 +4416,7 @@ class Music(commands.Cog):
 
         resolved, failed = 0, 0
         for item in entries:
+            track: Track | None = None
             try:
                 if item.url:
                     track = await asyncio.wait_for(
@@ -4223,11 +4427,31 @@ class Music(commands.Cog):
                     if path is None:
                         raise ValueError("no local file matches")
                     track = Track.from_file(path, interaction.user.display_name)
-                player.add(track)
-                resolved += 1
-            except Exception:
+            except Exception as exc:
+                # A like saved before the provider change holds a JioSaavn URL,
+                # which may be dead by now: fall back to the stored title.
+                log.info(
+                    "liked track %r: stored link failed (%s), trying a title search",
+                    item.title,
+                    reason_line(exc),
+                )
+                fallback = (
+                    f"{item.title} {item.artist}".strip() if item.artist else item.title
+                )
+                try:
+                    track = await asyncio.wait_for(
+                        resolve_track(fallback, interaction.user.display_name),
+                        timeout=45,
+                    )
+                except Exception:
+                    failed += 1
+                    log.debug("could not play liked track %r", item.title, exc_info=True)
+                    continue
+            if track is None:
                 failed += 1
-                log.debug("could not play liked track %r", item.title, exc_info=True)
+                continue
+            player.add(track)
+            resolved += 1
 
         reply = f"▶️ Queued **{resolved}** liked song{'s' if resolved != 1 else ''}."
         if failed:
@@ -4294,6 +4518,13 @@ class Music(commands.Cog):
             return
         except ValueError as exc:
             await interaction.followup.send(str(exc))
+            return
+        except SearchProviderError as exc:
+            log.warning("search provider failed for %r: %s", query, exc)
+            await interaction.followup.send(
+                f"I couldn't search YouTube Music for **{query}**.\n"
+                f"Reason: `{reason_line(exc)}`"
+            )
             return
         except (DownloadError, LookupError) as exc:
             await interaction.followup.send(
