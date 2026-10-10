@@ -1107,6 +1107,19 @@ def score_candidate(
     # Query words the candidate's title doesn't explain are treated as an artist
     # hint: "Flashing Lights Kanye West" -> {kanye, west}.
     artist_hint = q_tokens - candidate_title_tokens - set(requested_versions)
+    if not spec.get("artist") and title_sim >= 0.8:
+        # A near-spelling of a title word ("halde dil" -> "Hale Dil") is not
+        # evidence that the user supplied an artist name.
+        artist_hint = {
+            token
+            for token in artist_hint
+            if not any(
+                len(token) >= 4
+                and len(title_token) >= 4
+                and SequenceMatcher(None, token, title_token).ratio() >= 0.8
+                for title_token in candidate_title_tokens
+            )
+        }
 
     artist_mismatch = False
     artist_sim = 1.0

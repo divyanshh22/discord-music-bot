@@ -370,6 +370,17 @@ class SearchAccuracyTests(PatchedTestCase):
         self.assertEqual(results[0]["signals"]["title_similarity"], 1.0)
         self.assertFalse(results[0]["signals"]["artist_mismatch"])
 
+    def test_title_typo_is_not_mistaken_for_an_artist_hint(self):
+        candidate = norm(
+            song("hale-dil", "Hale Dil", ["Harshit Saxena"], "Murder", 300)
+        )[0]
+        self.patch(search_youtube_music=lambda query, limit=None: [dict(candidate)])
+        results = m.search_candidates("halde dil", m.MAX_POOL)
+        self.assertTrue(results)
+        self.assertEqual(results[0]["title"], "Hale Dil")
+        self.assertFalse(results[0]["signals"]["artist_hint"])
+        self.assertFalse(results[0]["signals"]["artist_mismatch"])
+
     def test_unrelated_first_result_is_not_selected(self):
         results = m.search_candidates("Those Eyes by New West", m.MAX_POOL)
         self.assertEqual(results[0]["artist"], "New West")
