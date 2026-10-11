@@ -1467,11 +1467,11 @@ if _NODE:
     YDL_OPTIONS["js_runtimes"] = {"node": {"path": _NODE}}
     log.info("node.js: %s (%s)", _NODE, _node_version(_NODE))
 else:
-    log.warning("node.js not found - some YouTube streams may fail with 403")
+    log.info("node.js not found; optional yt-dlp fallback is limited (Lavalink playback is independent)")
 
 
 
-log.info("ffmpeg: %s", find_ffmpeg() or "MISSING")
+log.debug("legacy ffmpeg helper: %s", find_ffmpeg() or "MISSING")
 
 
 # Queued googlevideo URLs are minted at queue time and are good for a few

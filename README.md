@@ -200,49 +200,36 @@ Errors are classified on purpose; the bot never turns one kind into another:
 
 ## Deploying to Render
 
-The bot and Lavalink are separate Render services in the same workspace and
-region. Both services should use always-on plans for reliable playback; the
-private Lavalink service requires a paid Render plan.
+### One free Web Service
 
-1. Create a **Private Service** from this repository, branch `main`, using the
-  Docker runtime. Leave Root Directory empty, set Dockerfile Path to
-  `lavalink/Dockerfile`, and use an always-on plan. Keep this service in the
-  same region as the bot.
-2. On the Lavalink service, set `LAVALINK_PASSWORD` to a long random secret.
-  The service listens privately on port `2333`; do not expose it publicly.
-3. Keep or create the bot's **Web Service** from branch `main`. Set Build
-  Command to `bash render-build.sh` and Start Command to `python bot.py`.
-4. Set these bot-service environment variables:
+This option runs Lavalink and the bot in one container, so it needs no separate
+Private Service or internal Lavalink URL.
 
-  - `DISCORD_TOKEN`: existing Discord bot token.
-  - `LAVALINK_URI`: `http://<Lavalink service internal address>:2333`, using
-    the address shown in that service's **Connect → Internal** panel.
-  - `LAVALINK_PASSWORD`: the same value as on the Lavalink service.
-  - `LAVALINK_LOCAL_AUDIO_BASE_URL`: the bot web service's internal HTTP address
-    (for example, `http://<bot internal address>:10000`) so Lavalink can read
-    files in `music/`.
-  - `LOCAL_AUDIO_SECRET`: a separate long random secret used to sign
-    short-lived local-file URLs.
-  - `DATABASE_URL`: optional, only for `/history` and persisted likes.
+1. In Render, create or edit a **Web Service** for this repository on branch
+   `main`. Choose **Docker**, leave Root Directory blank, and set Dockerfile
+   Path to `Dockerfile` at the repository root.
+2. Leave Build Command and Start Command blank so Render uses the Dockerfile.
+   Do not use `bash render-build.sh` for this combined image.
+3. In the Web Service's **Environment** tab, set:
 
-  If the bot web service is on Render Free, it cannot receive private-network
-  traffic. In that case set `LAVALINK_LOCAL_AUDIO_BASE_URL` to the bot's public
-  HTTPS `onrender.com` URL; local file requests remain protected by the signed
-  expiring URL. If you do not use local files, the two local-audio variables
-  are not needed.
+   - `DISCORD_TOKEN`: your existing Discord bot token.
+   - `LAVALINK_PASSWORD`: a generated secret. Lavalink and Wavelink share it;
+     the entrypoint sets Wavelink's URI to `http://127.0.0.1:2333` automatically.
+   - `DATABASE_URL`: optional, only for `/history` and persisted likes.
 
-5. Deploy Lavalink first, then the bot. Lavalink downloads the pinned YouTube
-  plugin at startup from the official Lavalink Maven repository.
+4. Deploy. The entrypoint starts the pinned Lavalink node, waits for port 2333,
+   then starts the bot and its HTTP health server on Render's `$PORT`.
 
-### Render build
+The container limits Java heap, metaspace, direct memory, and thread stacks to
+fit a 512 MB service as a best effort. **This is not guaranteed to fit or stay
+awake:** Lavalink and Python compete for the same 512 MB and 0.1 CPU, and
+Render Free Web Services can spin down when idle. If Render restarts the
+service for memory use or sleep, reliable 24/7 playback requires an always-on
+host. Lavalink's port is bound to loopback in this combined mode and is not
+exposed as a public endpoint.
 
-```bash
-bash render-build.sh
-```
-
-That existing script still installs the bot dependencies and legacy yt-dlp
-helpers. It does not build Lavalink; the private service builds from
-`lavalink/Dockerfile`.
+`lavalink/Dockerfile` remains available for a separate paid Private Service if
+you later choose that arrangement; do not use it for the single-service setup.
 
 ### Optional YouTube authentication
 
@@ -255,12 +242,11 @@ tokens apply only to the documented Web clients. Neither method guarantees
 playback or prevents Render IP restrictions. Do not paste tokens into source,
 commit them, or include them in support logs.
 
-### Render verification checklist
+### Verification checklist
 
-1. Lavalink logs show version `4.2.2`, the YouTube plugin `1.18.2` loaded, and
-  the node listening on port `2333`.
-2. Bot logs show `Lavalink node connected: tango-lavalink`; `/version` reports
-  Wavelink `3.5.2`.
+1. Render logs show Lavalink `4.2.2`, YouTube plugin `1.18.2`, then
+   `Lavalink node connected: tango-lavalink`.
+2. `/version` reports Wavelink `3.5.2`.
 3. Try `/search Those Eyes by New West`, then `/play Those Eyes by New West`.
   Confirm metadata is ranked first and a Lavalink track-start event appears.
 4. Test `/pause`, `/resume`, `/seek`, `/skip`, `/queue`, `/loop`, `/autoplay`,
