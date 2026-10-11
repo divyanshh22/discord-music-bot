@@ -30,3 +30,5 @@ _*.py
 
 # bgutil PO-token provider - cloned and compiled by the build, never committed
 potprovider/
+.render-runtime/
+Lavalink.jar

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+APP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$APP_ROOT"
+
 if [[ -z "${LAVALINK_PASSWORD:-}" ]]; then
   echo "ERROR: Set LAVALINK_PASSWORD in the Render service environment."
   exit 1
@@ -8,8 +11,21 @@ fi
 
 export LAVALINK_URI="${LAVALINK_URI:-http://127.0.0.1:2333}"
 export PORT="${PORT:-10000}"
+export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:--XX:+UseSerialGC -Xms64m -Xmx192m -XX:MaxMetaspaceSize=96m -XX:MaxDirectMemorySize=32m -Xss512k}"
 
-java -jar /app/Lavalink.jar --server.address=127.0.0.1 &
+JAVA_BIN="$APP_ROOT/.render-runtime/jre/bin/java"
+if [[ ! -x "$JAVA_BIN" ]]; then
+  JAVA_BIN="$(command -v java || true)"
+fi
+if [[ -z "$JAVA_BIN" || ! -x "$JAVA_BIN" ]]; then
+  echo "ERROR: Java 17 runtime not found; run bash render-build.sh first."
+  exit 1
+fi
+
+(
+  cd "$APP_ROOT/lavalink"
+  "$JAVA_BIN" -jar "$APP_ROOT/Lavalink.jar" --server.address=127.0.0.1
+) &
 lavalink_pid=$!
 bot_pid=""
 
@@ -48,7 +64,7 @@ if [[ "$ready" != "1" ]]; then
   exit 1
 fi
 
-python /app/bot.py &
+python "$APP_ROOT/bot.py" &
 bot_pid=$!
 
 set +e

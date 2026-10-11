@@ -200,36 +200,39 @@ Errors are classified on purpose; the bot never turns one kind into another:
 
 ## Deploying to Render
 
-### One free Web Service
+### One Native Web Service
 
-This option runs Lavalink and the bot in one container, so it needs no separate
-Private Service or internal Lavalink URL.
+This option runs Lavalink and the bot in the same Render Python Web Service;
+there is no separate Private Service and no Docker runtime requirement.
 
-1. In Render, create or edit a **Web Service** for this repository on branch
-   `main`. Choose **Docker**, leave Root Directory blank, and set Dockerfile
-   Path to `Dockerfile` at the repository root.
-2. Leave Build Command and Start Command blank so Render uses the Dockerfile.
-   Do not use `bash render-build.sh` for this combined image.
-3. In the Web Service's **Environment** tab, set:
+1. Use the existing Web Service or create one from this repository on branch
+  `main`. Leave Root Directory blank and keep the Python runtime.
+2. Set **Build Command** to `bash render-build.sh`.
+3. Set **Start Command** to `bash render-entrypoint.sh`.
+4. In the service's **Environment** tab, set:
 
-   - `DISCORD_TOKEN`: your existing Discord bot token.
-   - `LAVALINK_PASSWORD`: a generated secret. Lavalink and Wavelink share it;
-     the entrypoint sets Wavelink's URI to `http://127.0.0.1:2333` automatically.
-   - `DATABASE_URL`: optional, only for `/history` and persisted likes.
+  - `DISCORD_TOKEN`: your existing Discord bot token.
+  - `LAVALINK_PASSWORD`: a generated secret shared by Lavalink and Wavelink.
+  - `DATABASE_URL`: optional, only for `/history` and persisted likes.
 
-4. Deploy. The entrypoint starts the pinned Lavalink node, waits for port 2333,
-   then starts the bot and its HTTP health server on Render's `$PORT`.
+  Leave `LAVALINK_URI` unset; the start script sets it to
+  `http://127.0.0.1:2333`. Render supplies `PORT` automatically. No
+  `LOCAL_AUDIO_*` variables are needed if you do not play files from `music/`.
 
-The container limits Java heap, metaspace, direct memory, and thread stacks to
-fit a 512 MB service as a best effort. **This is not guaranteed to fit or stay
-awake:** Lavalink and Python compete for the same 512 MB and 0.1 CPU, and
-Render Free Web Services can spin down when idle. If Render restarts the
-service for memory use or sleep, reliable 24/7 playback requires an always-on
-host. Lavalink's port is bound to loopback in this combined mode and is not
-exposed as a public endpoint.
+5. Deploy. The build command installs Python dependencies, downloads and
+  verifies the official Java 17 JRE and Lavalink `4.2.2`; the start command
+  starts Lavalink on loopback, waits for it, then launches the bot.
 
-`lavalink/Dockerfile` remains available for a separate paid Private Service if
-you later choose that arrangement; do not use it for the single-service setup.
+The scripts apply conservative Java memory limits, but **a 512 MB Render Free
+instance is not guaranteed to fit or stay awake**. Lavalink and Python share
+the same memory/CPU, and Free Web Services can spin down when idle. OOM or sleep
+may interrupt playback; this is a no-cost experiment, not guaranteed 24/7
+hosting. Lavalink's port is bound to loopback and is not publicly exposed.
+
+The root `Dockerfile` is an alternative combined image path; do not select
+Docker runtime when using the two Native Build/Start commands above.
+`lavalink/Dockerfile` is the separate-service option, which requires a paid
+Render Private Service.
 
 ### Optional YouTube authentication
 
